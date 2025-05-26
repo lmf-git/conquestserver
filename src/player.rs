@@ -6,6 +6,7 @@ use crate::messages::{PlayerState, PlayerInput};
 
 #[derive(Clone)]
 pub struct Player {
+    #[allow(dead_code)]  // We use this for logging and identification
     pub id: Uuid,
     pub body_handle: RigidBodyHandle,
     pub collider_handle: ColliderHandle,
@@ -23,6 +24,8 @@ impl Player {
     pub fn new(id: Uuid, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) -> Self {
         // Player spawn position (above platform)
         let spawn_position = vector![0.0, 35.0, 0.0];
+        
+        tracing::info!("Creating player with ID: {}", id); // Use the id field
         
         // Create player rigid body
         let rigid_body = RigidBodyBuilder::dynamic()

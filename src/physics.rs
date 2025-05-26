@@ -1,10 +1,9 @@
-use nalgebra::{Point3, Vector3, UnitQuaternion};
+use nalgebra::{Point3, Vector3};
 use rapier3d::prelude::*;
 use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::player::Player;
-use crate::messages::PlayerInput;
 
 pub struct PhysicsWorld {
     pub rigid_body_set: RigidBodySet,
@@ -59,26 +58,6 @@ impl PhysicsWorld {
     pub fn remove_player(&mut self, id: Uuid) {
         if let Some(player) = self.players.remove(&id) {
             player.remove_from_world(&mut self.rigid_body_set, &mut self.collider_set);
-        }
-    }
-    
-    pub fn update_player_input(&mut self, id: Uuid, input: PlayerInput) {
-        // Get the current sequence before borrowing mutably
-        let current_sequence = self.players.get(&id)
-            .map(|player| player.input_sequence)
-            .unwrap_or(0);
-        
-        // Now we can safely get mutable access
-        if let Some(player) = self.players.get_mut(&id) {
-            player.apply_input(input, current_sequence);
-        }
-    }
-    
-    pub fn get_player_state(&self, id: Uuid) -> Option<(Point3<f32>, Vector3<f32>, UnitQuaternion<f32>)> {
-        if let Some(player) = self.players.get(&id) {
-            Some((player.position, player.velocity, player.rotation))
-        } else {
-            None
         }
     }
     
