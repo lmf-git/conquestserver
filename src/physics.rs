@@ -79,8 +79,21 @@ impl PhysicsWorld {
     }
     
     pub fn remove_player(&mut self, id: Uuid) {
-        if let Some(player) = self.players.remove(&id) {
+        tracing::info!("Removing player {} from physics world", id);
+        
+        if let Some(player) = self.players.get(&id) {
+            tracing::debug!("Player {} handles - body: {:?}, collider: {:?}", 
+                id, player.body_handle, player.collider_handle);
+            
+            // Use the player's own removal method
             player.remove_from_world(&mut self.rigid_body_set, &mut self.collider_set);
+            
+            // Remove from our tracking
+            self.players.remove(&id);
+            
+            tracing::info!("Successfully removed player {} from physics world", id);
+        } else {
+            tracing::warn!("Player {} not found in physics world during removal", id);
         }
     }
     
@@ -204,7 +217,7 @@ impl PhysicsWorld {
     pub fn step(&mut self) {
         // Apply planet-centered gravity to all dynamic bodies including players
         let planet_center = Point3::new(0.0, -250.0, 0.0);
-        let gravity_strength = 15.0; // Further reduced gravity strength
+        let gravity_strength = 12.0; // Further reduced gravity strength to prevent instability
         
         // First, collect handles and world positions for ALL dynamic bodies
         let mut body_data: Vec<(RigidBodyHandle, Vector3<f32>, bool)> = Vec::new();
@@ -236,9 +249,9 @@ impl PhysicsWorld {
                 
                 // Apply very conservative gravity scaling
                 let gravity_multiplier = if distance_to_planet > 150.0 {
-                    (500.0 / distance_to_planet).min(1.0) // Much more conservative
+                    (400.0 / distance_to_planet).min(0.8) // Even more conservative
                 } else {
-                    1.0 // Constant close-range gravity
+                    0.8 // Reduced constant close-range gravity
                 };
                 
                 let gravity_dir = to_planet.normalize();
@@ -247,9 +260,9 @@ impl PhysicsWorld {
                 
                 body.add_force(gravity_force, true);
                 
-                // Log gravity application for debugging
+                // Log gravity application for debugging (less frequently)
                 if is_player {
-                    tracing::debug!(
+                    tracing::trace!(
                         "Applied planet gravity to player - World pos: [{:.1}, {:.1}, {:.1}], Distance: {:.1}, Force: [{:.1}, {:.1}, {:.1}]",
                         world_position.x, world_position.y, world_position.z,
                         distance_to_planet,
@@ -259,13 +272,17 @@ impl PhysicsWorld {
             }
         }
         
-        // Use ultra-conservative integration parameters
+        // Use extremely conservative integration parameters to prevent solver crashes
         let mut ultra_conservative_params = self.integration_parameters.clone();
         ultra_conservative_params.dt = 1.0 / 60.0; // Fixed timestep
-        ultra_conservative_params.max_velocity_iterations = 2; // Very reduced iterations
+        ultra_conservative_params.max_velocity_iterations = 1; // Minimal iterations
         ultra_conservative_params.max_velocity_friction_iterations = 1; // Minimal friction iterations
         ultra_conservative_params.max_stabilization_iterations = 1; // Minimal stabilization
         ultra_conservative_params.max_ccd_substeps = 1; // Minimal CCD
+        ultra_conservative_params.erp = 0.2; // Reduced error reduction parameter
+        ultra_conservative_params.damping_ratio = 0.25; // Add some damping
+        ultra_conservative_params.joint_erp = 0.2; // Reduced joint error reduction
+        ultra_conservative_params.joint_damping_ratio = 0.25; // Add joint damping
         
         // Step the physics simulation with ultra-conservative parameters
         self.physics_pipeline.step(
@@ -288,10 +305,19 @@ impl PhysicsWorld {
         self.query_pipeline.update(&self.rigid_body_set, &self.collider_set);
         
         // Update player physics (this handles movement, jumping, etc.)
+        // Use a safer iteration approach
         let player_ids: Vec<Uuid> = self.players.keys().cloned().collect();
         for player_id in player_ids {
+            // Check if player still exists (might have been removed during iteration)
             if let Some(player) = self.players.get_mut(&player_id) {
-                player.update_physics(&mut self.rigid_body_set, &self.collider_set);
+                // Verify the physics bodies still exist before updating
+                if self.rigid_body_set.get(player.body_handle).is_some() &&
+                   self.collider_set.get(player.collider_handle).is_some() {
+                    player.update_physics(&mut self.rigid_body_set, &self.collider_set);
+                } else {
+                    tracing::warn!("Player {} physics bodies missing during update, removing from tracking", player_id);
+                    self.players.remove(&player_id);
+                }
             }
         }
     }

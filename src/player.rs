@@ -19,6 +19,9 @@ pub struct Player {
     pub rotation: UnitQuaternion<f32>,
     pub input: PlayerInput,
     pub last_ground_normal: Vector3<f32>,
+    // Remove unused collision tracking fields - we use simpler raycast approach
+    pub last_ground_contact: f32, // Store as seconds since game start
+    pub player_height: f32, // Add this field for grounding calculations
 }
 
 impl Player {
@@ -98,6 +101,105 @@ impl Player {
                 world_origin: [0.0, 0.0, 0.0],
             },
             last_ground_normal: Vector3::y(),
+            last_ground_contact: 0.0,
+            player_height: player_height, // Store the height for later use
+        }
+    }
+    
+    fn check_grounded(&mut self, rigid_body_set: &RigidBodySet, collider_set: &ColliderSet) {
+        // Use the same logic as original client: collisions + raycasts + velocity
+        if let Some(body) = rigid_body_set.get(self.body_handle) {
+            let body_position = body.translation();
+            let local_pos = Point3::new(body_position.x, body_position.y, body_position.z);
+            
+            // Calculate world position for gravity direction
+            let world_pos = local_pos + self.world_origin;
+            let ray_origin = Point3::from(world_pos);
+            
+            // Use same planet center as physics world
+            let planet_center = Point3::new(0.0, -250.0, 0.0);
+            let to_planet = planet_center - ray_origin;
+            let ray_dir = to_planet.normalize();
+            let max_distance = 1.5; // Match client raycast distance
+            
+            // Convert back to local space for raycasting
+            let local_ray_origin = Point3::from(local_pos.coords);
+            let _ray = Ray::new(local_ray_origin, ray_dir); // Prefix with underscore to indicate intentional
+            let filter = QueryFilter::default().exclude_collider(self.collider_handle);
+            
+            // Create a temporary query pipeline for raycasting
+            let mut query_pipeline = QueryPipeline::new();
+            query_pipeline.update(rigid_body_set, collider_set);
+            
+            // Check velocity in gravity direction (same as client)
+            let velocity = body.linvel();
+            let velocity_in_gravity_dir = velocity.dot(&ray_dir);
+            let low_downward_velocity = velocity_in_gravity_dir < 3.0; // Match client threshold
+            
+            // Check for ray hits (multiple rays like client)
+            let player_quat = body.rotation();
+            let foot_offset = 0.4 * 0.8; // playerRadius * 0.8
+            let foot_level = -self.player_height * 0.5;
+            
+            // Calculate foot positions like client
+            let left_offset = Vector3::new(-foot_offset, foot_level, 0.0);
+            let right_offset = Vector3::new(foot_offset, foot_level, 0.0);
+            let center_offset = Vector3::new(0.0, foot_level, 0.0);
+            
+            // Rotate offsets by player rotation
+            let left_offset_rotated = player_quat * left_offset;
+            let right_offset_rotated = player_quat * right_offset;
+            let center_offset_rotated = player_quat * center_offset;
+            
+            let left_foot_world = local_pos + left_offset_rotated;
+            let right_foot_world = local_pos + right_offset_rotated;
+            let center_foot_world = local_pos + center_offset_rotated;
+            
+            // Cast multiple rays like client
+            let left_ray = Ray::new(Point3::from(left_foot_world.coords), ray_dir);
+            let right_ray = Ray::new(Point3::from(right_foot_world.coords), ray_dir);
+            let center_ray = Ray::new(Point3::from(center_foot_world.coords), ray_dir);
+            
+            let left_hit = query_pipeline.cast_ray(
+                rigid_body_set, collider_set, &left_ray, max_distance, true, filter
+            );
+            let right_hit = query_pipeline.cast_ray(
+                rigid_body_set, collider_set, &right_ray, max_distance, true, filter
+            );
+            let center_hit = query_pipeline.cast_ray(
+                rigid_body_set, collider_set, &center_ray, max_distance, true, filter
+            );
+            
+            let has_ray_hits = left_hit.is_some() || right_hit.is_some() || center_hit.is_some();
+            
+            // Simplified collision detection - just check if we have recent ground contact from raycasts
+            let has_ground_collisions = has_ray_hits && self.last_ground_contact > 0.5;
+            let recent_ground_contact = self.last_ground_contact > 0.5;
+            
+            // Use EXACT same grounding logic as client
+            self.is_grounded = (has_ground_collisions && low_downward_velocity) || 
+                              (has_ray_hits && low_downward_velocity) ||
+                              (recent_ground_contact && velocity_in_gravity_dir.abs() < 0.5);
+            
+            // Store the gravity direction as the ground normal (inverted)
+            if self.is_grounded {
+                self.last_ground_normal = -ray_dir;
+                
+                tracing::debug!(
+                    "Player {} grounded - Ray hits: {}, Vel in gravity dir: {:.2}",
+                    self.id, has_ray_hits, velocity_in_gravity_dir
+                );
+            }
+            
+            // Update last ground contact timer
+            if has_ray_hits {
+                self.last_ground_contact = 1.0; // Mark as recent contact
+            } else if self.last_ground_contact > 0.0 {
+                self.last_ground_contact -= 0.016; // Approximate frame time
+                if self.last_ground_contact < 0.0 {
+                    self.last_ground_contact = 0.0;
+                }
+            }
         }
     }
     
@@ -117,16 +219,26 @@ impl Player {
             input.world_origin[2]
         );
         
-        // Now we can move input
+        // Store input for movement calculation
         self.input = input;
         
         // Convert to local position
         let local_pos = client_world_pos - self.world_origin;
         self.position = Point3::from(local_pos);
+        
+        // Log significant input changes for debugging
+        if self.input.forward || self.input.backward || self.input.left || self.input.right || 
+           self.input.jump || self.input.yaw.abs() > 0.01 {
+            tracing::debug!(
+                "Player {} input applied - forward: {}, yaw: {:.2}, jump: {}, world_pos: [{:.1}, {:.1}, {:.1}]",
+                self.id, self.input.forward, self.input.yaw, self.input.jump,
+                client_world_pos.x, client_world_pos.y, client_world_pos.z
+            );
+        }
     }
-    
+
     pub fn update_physics(&mut self, rigid_body_set: &mut RigidBodySet, collider_set: &ColliderSet) {
-        // First, check grounding without holding a mutable borrow
+        // First, check grounding using collision events + raycasts (like client)
         self.check_grounded(rigid_body_set, collider_set);
         
         // Then update physics with mutable access
@@ -140,7 +252,7 @@ impl Player {
             self.velocity = Vector3::new(linvel.x, linvel.y, linvel.z);
             self.rotation = *rotation;
             
-            // Apply movement based on input - this was missing for other players!
+            // Apply movement based on input - ONLY process if we have actual input
             let current_vel = body.linvel();
             let mut new_velocity = Vector3::new(current_vel.x, current_vel.y, current_vel.z);
             
@@ -189,40 +301,40 @@ impl Player {
             // Calculate movement vector
             let movement: Vector3<f32> = final_forward * move_dir.z + final_right * move_dir.x;
             
-            // Apply movement force
+            // Apply movement force - be more conservative to prevent conflicts
             if self.is_grounded {
-                let ground_accel = 100.0f32;
+                let ground_accel = 60.0f32; // Reduced from 100
                 new_velocity += movement * ground_accel * 0.016f32;
                 
                 // Apply friction when not moving
                 if move_dir.magnitude() == 0.0 {
-                    new_velocity.x *= 0.8;
-                    new_velocity.z *= 0.8;
+                    new_velocity.x *= 0.9; // Increased friction
+                    new_velocity.z *= 0.9;
                 }
                 
-                // Clamp velocity against gravity if grounded
+                // More aggressive velocity clamping when grounded
                 let world_pos = self.position + self.world_origin;
                 let planet_center = Point3::new(0.0, -250.0, 0.0);
                 let to_planet = planet_center - world_pos;
                 let gravity_dir = to_planet.normalize();
                 
                 let downward_vel = new_velocity.dot(&gravity_dir);
-                if downward_vel > 5.0 { // Prevent excessive downward velocity when grounded
-                    new_velocity -= gravity_dir * (downward_vel - 2.0);
+                if downward_vel > 2.0 { // More aggressive clamping
+                    new_velocity -= gravity_dir * (downward_vel - 1.0);
                 }
             } else {
-                // Air control
-                let air_control = 1.0f32;
+                // Reduce air control to prevent conflicts
+                let air_control = 0.5f32; // Reduced from 1.0
                 new_velocity += movement * air_control * 0.016f32;
                 
                 // Air resistance
-                new_velocity.x *= 0.95;
-                new_velocity.z *= 0.95;
+                new_velocity.x *= 0.98; // More resistance
+                new_velocity.z *= 0.98;
             }
             
-            // Handle jump
+            // Handle jump - be more conservative
             if self.input.jump && self.is_grounded {
-                let jump_impulse = self.last_ground_normal * 8.0;
+                let jump_impulse = self.last_ground_normal * 6.0; // Reduced from 8.0
                 new_velocity += jump_impulse;
                 tracing::debug!("Player {} jumped with impulse: [{:.1}, {:.1}, {:.1}]", 
                     self.id, jump_impulse.x, jump_impulse.y, jump_impulse.z);
@@ -232,7 +344,7 @@ impl Player {
             if self.is_grounded && self.input.yaw.abs() > 0.001 {
                 let yaw_rotation = UnitQuaternion::from_axis_angle(
                     &Unit::new_normalize(self.last_ground_normal),
-                    self.input.yaw * 0.1 // Reduce rotation speed
+                    self.input.yaw * 0.05 // Further reduced rotation speed
                 );
                 self.rotation = yaw_rotation * self.rotation;
                 body.set_rotation(self.rotation, true);
@@ -258,62 +370,6 @@ impl Player {
         }
     }
     
-    fn check_grounded(&mut self, rigid_body_set: &RigidBodySet, collider_set: &ColliderSet) {
-        // Use planet-centered gravity for ground detection (same as physics world)
-        if let Some(body) = rigid_body_set.get(self.body_handle) {
-            let body_position = body.translation();
-            let local_pos = Point3::new(body_position.x, body_position.y, body_position.z);
-            
-            // Calculate world position for gravity direction
-            let world_pos = local_pos + self.world_origin;
-            let ray_origin = Point3::from(world_pos);
-            
-            // Use same planet center as physics world
-            let planet_center = Point3::new(0.0, -250.0, 0.0);
-            let to_planet = planet_center - ray_origin;
-            let ray_dir = to_planet.normalize();
-            let max_distance = 1.5; // Increased raycast distance
-            
-            // Convert back to local space for raycasting
-            let local_ray_origin = Point3::from(local_pos.coords);
-            let ray = Ray::new(local_ray_origin, ray_dir);
-            let filter = QueryFilter::default().exclude_collider(self.collider_handle);
-            
-            // Create a temporary query pipeline for raycasting
-            let mut query_pipeline = QueryPipeline::new();
-            query_pipeline.update(rigid_body_set, collider_set);
-            
-            // Also check velocity - if moving slowly in gravity direction, likely grounded
-            let velocity = body.linvel();
-            let velocity_in_gravity_dir = velocity.dot(&ray_dir);
-            let slow_descent = velocity_in_gravity_dir < 3.0;
-            
-            if let Some((_handle, toi)) = query_pipeline.cast_ray(
-                rigid_body_set,
-                collider_set,
-                &ray,
-                max_distance,
-                true,
-                filter,
-            ) {
-                // Ground hit found
-                self.is_grounded = toi < 1.0 && slow_descent;
-                
-                // Store the gravity direction as the ground normal (inverted)
-                self.last_ground_normal = -ray_dir;
-                
-                if self.is_grounded {
-                    tracing::debug!(
-                        "Player {} grounded - Distance to ground: {:.2}, Velocity in gravity dir: {:.2}",
-                        self.id, toi, velocity_in_gravity_dir
-                    );
-                }
-            } else {
-                self.is_grounded = false;
-            }
-        }
-    }
-    
     pub fn get_state(&self) -> PlayerState {
         // Convert local position to world position for network transmission
         let world_position = self.position + self.world_origin;
@@ -334,18 +390,24 @@ impl Player {
     }
     
     pub fn remove_from_world(&self, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) {
+        tracing::info!("Removing player {} from physics world", self.id);
+        
         // Remove collider first
         if let Some(_collider) = collider_set.get(self.collider_handle) {
+            tracing::debug!("Removing collider for player {}", self.id);
             collider_set.remove(
                 self.collider_handle,
                 &mut IslandManager::new(),
                 rigid_body_set,
                 true,
             );
+        } else {
+            tracing::warn!("Collider for player {} not found during removal", self.id);
         }
         
         // Then remove rigid body
         if let Some(_body) = rigid_body_set.get(self.body_handle) {
+            tracing::debug!("Removing rigid body for player {}", self.id);
             rigid_body_set.remove(
                 self.body_handle,
                 &mut IslandManager::new(),
@@ -354,6 +416,10 @@ impl Player {
                 &mut MultibodyJointSet::new(),
                 true,
             );
+        } else {
+            tracing::warn!("Rigid body for player {} not found during removal", self.id);
         }
+        
+        tracing::info!("Successfully removed player {} from physics world", self.id);
     }
 }

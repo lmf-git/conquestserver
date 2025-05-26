@@ -219,11 +219,20 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     info!("Cleaning up player {}", player_id);
     outgoing_task.abort();
     
-    // Remove player from game
+    // Remove player from game with error handling
     {
         let mut physics_world = game_state.physics_world.write().await;
+        
+        // Remove from game state first
+        if let Some(_player) = game_state.players.remove(&player_id) {
+            info!("Removed player {} from game state", player_id);
+        }
+        
+        // Then remove from physics world
         physics_world.remove_player(player_id);
-        game_state.players.remove(&player_id);
+        
+        // Log remaining player count
+        info!("Remaining players in physics world: {}", physics_world.players.len());
     }
     
     // Notify others that player left
@@ -240,18 +249,23 @@ async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::Input { input, sequence } => {
-            // Update in physics world
+            // Update ONLY in physics world - this is the authoritative source
             {
                 let mut physics_world = game_state.physics_world.write().await;
                 if let Some(physics_player) = physics_world.players.get_mut(&player_id) {
-                    physics_player.apply_input(input.clone(), sequence);
+                    // Apply input to physics player (this will update their movement)
+                    physics_player.apply_input(input, sequence);
                     
-                    // Also update in game state for immediate reflection
-                    if let Some(mut game_player) = game_state.players.get_mut(&player_id) {
-                        game_player.apply_input(input, sequence);
+                    // Log input received for debugging
+                    if sequence % 60 == 0 { // Log every second
+                        tracing::debug!(
+                            "Applied input for player {} - sequence: {}, forward: {}, yaw: {:.2}",
+                            player_id, sequence, physics_player.input.forward, physics_player.input.yaw
+                        );
                     }
                 }
             }
+            // Note: Don't update game_state.players here - let physics loop sync it
         }
         ClientMessage::Ping { timestamp } => {
             let pong = ServerMessage::Pong {
@@ -289,23 +303,27 @@ async fn physics_loop(game_state: GameState) {
                 }
             }
             
-            // Log player states every second (60 frames)
+            // Log player states every second (60 frames) with movement tracking
             if frame_count % 60 == 0 {
                 for (player_id, player) in &physics_world.players {
                     let world_pos = player.position + player.world_origin;
-                    tracing::debug!(
-                        "Player {} - World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}",
+                    let is_moving = player.velocity.magnitude() > 0.1;
+                    let has_input = player.input.forward || player.input.backward || 
+                                   player.input.left || player.input.right;
+                    
+                    tracing::info!(
+                        "Player {} - World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}, Moving: {}, Has input: {}",
                         player_id,
                         world_pos.x, world_pos.y, world_pos.z,
                         player.velocity.x, player.velocity.y, player.velocity.z,
-                        player.is_grounded
+                        player.is_grounded, is_moving, has_input
                     );
                 }
             }
         }
         
-        // Broadcast state at a fixed interval to reduce network traffic
-        if last_broadcast.elapsed() > Duration::from_millis(50) {
+        // Broadcast state more frequently to ensure movement is visible
+        if last_broadcast.elapsed() > Duration::from_millis(33) { // 30 FPS broadcast rate
             broadcast_state(&game_state).await;
             last_broadcast = tokio::time::Instant::now();
         }
