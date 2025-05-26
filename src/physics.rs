@@ -66,24 +66,30 @@ impl PhysicsWorld {
         let planet_center = Point3::new(0.0, -250.0, 0.0);
         let gravity_strength = 25.0;
         
-        for (_, body) in self.rigid_body_set.iter_mut() {
+        // First, collect handles and world positions for dynamic bodies
+        let mut body_data: Vec<(RigidBodyHandle, Vector3<f32>)> = Vec::new();
+        
+        for (handle, body) in self.rigid_body_set.iter() {
             if body.body_type() == RigidBodyType::Dynamic {
                 let position = body.translation();
                 
-                // For player bodies, we need to consider their world origin
-                let world_position = if let Some(player_id) = self.find_player_by_body_handle(body.handle()) {
-                    if let Some(player) = self.players.get(&player_id) {
-                        // Convert local position to world position for gravity calculation
-                        position + player.world_origin.coords
-                    } else {
-                        position
-                    }
-                } else {
-                    position
-                };
+                // Check if this is a player body and get their world origin
+                let world_origin = self.players.values()
+                    .find(|p| p.body_handle == handle)
+                    .map(|p| p.world_origin)
+                    .unwrap_or(Vector3::zeros());
                 
+                // Calculate world position
+                let world_position = position + world_origin;
+                body_data.push((handle, world_position));
+            }
+        }
+        
+        // Now apply gravity to each dynamic body
+        for (handle, world_position) in body_data {
+            if let Some(body) = self.rigid_body_set.get_mut(handle) {
                 let to_planet = planet_center - Point3::from(world_position);
-                let gravity_dir = to_planet.coords.normalize();
+                let gravity_dir = to_planet.normalize();
                 let gravity_force = gravity_dir * gravity_strength * body.mass();
                 
                 body.add_force(gravity_force, true);
@@ -117,16 +123,6 @@ impl PhysicsWorld {
                 player.update_physics(&mut self.rigid_body_set, &self.collider_set);
             }
         }
-    }
-    
-    // Add helper method to find player by body handle
-    fn find_player_by_body_handle(&self, handle: RigidBodyHandle) -> Option<Uuid> {
-        for (id, player) in &self.players {
-            if player.body_handle == handle {
-                return Some(*id);
-            }
-        }
-        None
     }
     
     fn create_planet(&mut self) {

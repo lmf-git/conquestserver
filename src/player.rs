@@ -105,15 +105,16 @@ impl Player {
             self.velocity = *body.linvel();
             
             // Check if we need to shift the player's local origin
-            let local_distance = self.position.coords.magnitude();
+            let local_pos_vec = self.position - Point3::origin();
+            let local_distance = local_pos_vec.magnitude();
             if local_distance > 500.0 { // Half of client's ORIGIN_SHIFT_THRESHOLD
                 // Shift the origin
-                let shift = self.position.coords;
+                let shift = local_pos_vec;
                 self.world_origin += shift;
                 
                 // Reset local position to near origin
                 let new_local_pos = Point3::origin();
-                body.set_translation(new_local_pos.coords, true);
+                body.set_translation(vector![new_local_pos.x, new_local_pos.y, new_local_pos.z], true);
                 self.position = new_local_pos;
                 
                 tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
@@ -273,16 +274,6 @@ impl Player {
             input_sequence: self.input_sequence,
             world_origin: [self.world_origin.x, self.world_origin.y, self.world_origin.z],
         }
-    }
-    
-    // Add method to get local position (for physics calculations)
-    pub fn get_local_position(&self) -> Point3<f32> {
-        self.position
-    }
-    
-    // Add method to convert world position to local position
-    pub fn world_to_local(&self, world_pos: Point3<f32>) -> Point3<f32> {
-        world_pos - self.world_origin
     }
     
     pub fn remove_from_world(&self, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) {
