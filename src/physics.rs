@@ -80,7 +80,7 @@ impl PhysicsWorld {
                     .unwrap_or(Vector3::zeros());
                 
                 // Calculate world position
-                let world_position = position + world_origin;
+                let world_position = Vector3::new(position.x, position.y, position.z) + world_origin;
                 body_data.push((handle, world_position));
             }
         }
@@ -93,6 +93,15 @@ impl PhysicsWorld {
                 let gravity_force = gravity_dir * gravity_strength * body.mass();
                 
                 body.add_force(gravity_force, true);
+                
+                // Debug log for player bodies
+                if self.players.values().any(|p| p.body_handle == handle) {
+                    tracing::debug!(
+                        "Applied gravity to player body: force=[{:.2}, {:.2}, {:.2}], world_pos=[{:.1}, {:.1}, {:.1}]",
+                        gravity_force.x, gravity_force.y, gravity_force.z,
+                        world_position.x, world_position.y, world_position.z
+                    );
+                }
             }
         }
         
@@ -116,7 +125,7 @@ impl PhysicsWorld {
         // Update query pipeline for raycasting
         self.query_pipeline.update(&self.rigid_body_set, &self.collider_set);
         
-        // Update player physics
+        // Update player physics (this handles movement, jumping, etc.)
         let player_ids: Vec<Uuid> = self.players.keys().cloned().collect();
         for player_id in player_ids {
             if let Some(player) = self.players.get_mut(&player_id) {

@@ -143,23 +143,10 @@ impl Player {
                     self.id, shift, self.world_origin);
             }
             
-            // Apply planet-centered gravity (using WORLD coordinates)
-            let planet_center = Point3::new(0.0, -250.0, 0.0); // Planet center in world coords
-            let gravity_strength = 25.0;
-            
-            // Convert player position to world coordinates for gravity calculation
-            let world_position = self.position + self.world_origin;
-            let to_planet = planet_center - world_position;
-            let gravity_dir = to_planet.normalize();
-            let gravity_force = gravity_dir * gravity_strength * 0.016f32; // 60Hz frame time
-            
-            // Apply gravity to velocity
+            // NOTE: Gravity is already applied in PhysicsWorld::step(), so we don't apply it here
+            // Just get the current velocity that already includes gravity
             let current_vel = body.linvel();
-            let new_velocity = Vector3::new(
-                current_vel.x + gravity_force.x,
-                current_vel.y + gravity_force.y,
-                current_vel.z + gravity_force.z,
-            );
+            let mut new_velocity = Vector3::new(current_vel.x, current_vel.y, current_vel.z);
             
             // Apply movement based on input - fix type annotation
             let mut move_dir: Vector3<f32> = Vector3::zeros();
@@ -207,37 +194,35 @@ impl Player {
             let movement: Vector3<f32> = final_forward * move_dir.z + final_right * move_dir.x;
             
             // Apply movement force
-            let mut final_velocity = new_velocity;
-            
             if self.is_grounded {
                 let ground_accel = 100.0f32;
-                final_velocity += movement * ground_accel * 0.016f32;
+                new_velocity += movement * ground_accel * 0.016f32;
                 
                 // Apply friction when not moving
                 if move_dir.magnitude() == 0.0 {
-                    final_velocity.x *= 0.8;
-                    final_velocity.y *= 0.95;
-                    final_velocity.z *= 0.8;
+                    new_velocity.x *= 0.8;
+                    new_velocity.y *= 0.95;
+                    new_velocity.z *= 0.8;
                 }
             } else {
                 // Air control
                 let air_control = 1.0f32;
-                final_velocity += movement * air_control * 0.016f32;
+                new_velocity += movement * air_control * 0.016f32;
                 
                 // Air resistance
-                final_velocity.x *= 0.95;
-                final_velocity.y *= 0.98;
-                final_velocity.z *= 0.95;
+                new_velocity.x *= 0.95;
+                new_velocity.y *= 0.98;
+                new_velocity.z *= 0.95;
             }
             
             // Handle jump
             if self.input.jump && self.is_grounded {
                 let jump_impulse = self.last_ground_normal * 8.0;
-                final_velocity += jump_impulse;
+                new_velocity += jump_impulse;
             }
             
             // Set the final velocity
-            body.set_linvel(final_velocity, true);
+            body.set_linvel(new_velocity, true);
             
             // Update rotation based on mouse input (only yaw when grounded)
             if self.is_grounded {
@@ -257,28 +242,42 @@ impl Player {
     
     fn check_grounded(&mut self, rigid_body_set: &RigidBodySet, collider_set: &ColliderSet) {
         // Simple ground check using raycast
-        let ray_origin = self.position;
-        let ray_dir = -Vector3::y();
-        let max_distance = 1.0;
-        
-        let ray = Ray::new(ray_origin, ray_dir);
-        let filter = QueryFilter::default().exclude_collider(self.collider_handle);
-        
-        // Create a temporary query pipeline for raycasting
-        let mut query_pipeline = QueryPipeline::new();
-        query_pipeline.update(rigid_body_set, collider_set);
-        
-        if let Some((_handle, _toi)) = query_pipeline.cast_ray(
-            rigid_body_set,
-            collider_set,
-            &ray,
-            max_distance,
-            true,
-            filter,
-        ) {
-            self.is_grounded = true;
-        } else {
-            self.is_grounded = false;
+        if let Some(body) = rigid_body_set.get(self.body_handle) {
+            let ray_origin = Point3::from(*body.translation());
+            
+            // Use gravity direction for ray
+            let planet_center = Point3::new(0.0, -250.0, 0.0);
+            let to_planet = planet_center - ray_origin;
+            let ray_dir = to_planet.normalize();
+            let max_distance = 1.0;
+            
+            let ray = Ray::new(ray_origin, ray_dir);
+            let filter = QueryFilter::default().exclude_collider(self.collider_handle);
+            
+            // Create a temporary query pipeline for raycasting
+            let mut query_pipeline = QueryPipeline::new();
+            query_pipeline.update(rigid_body_set, collider_set);
+            
+            if let Some((_handle, _toi)) = query_pipeline.cast_ray(
+                rigid_body_set,
+                collider_set,
+                &ray,
+                max_distance,
+                true,
+                filter,
+            ) {
+                self.is_grounded = true;
+                
+                // For now, use the ray direction as the ground normal
+                // (inverted because the ray points down)
+                self.last_ground_normal = -ray_dir;
+                
+                // Note: Getting the exact surface normal at the hit point would require
+                // more complex calculations with the collider shape, so we'll use
+                // the simplified approach for now
+            } else {
+                self.is_grounded = false;
+            }
         }
     }
     

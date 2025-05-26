@@ -250,9 +250,11 @@ async fn handle_client_message(
 async fn physics_loop(game_state: GameState) {
     let mut interval = tokio::time::interval(Duration::from_millis(16)); // 60 FPS
     let mut last_broadcast = tokio::time::Instant::now();
+    let mut frame_count = 0u64;
     
     loop {
         interval.tick().await;
+        frame_count += 1;
         
         // Update physics
         {
@@ -269,6 +271,20 @@ async fn physics_loop(game_state: GameState) {
                     game_player.value_mut().is_grounded = physics_player.is_grounded;
                     game_player.value_mut().world_origin = physics_player.world_origin;
                     game_player.value_mut().input_sequence = physics_player.input_sequence;
+                }
+            }
+            
+            // Log player states every second (60 frames)
+            if frame_count % 60 == 0 {
+                for (player_id, player) in &physics_world.players {
+                    let world_pos = player.position + player.world_origin;
+                    tracing::debug!(
+                        "Player {} - World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}",
+                        player_id,
+                        world_pos.x, world_pos.y, world_pos.z,
+                        player.velocity.x, player.velocity.y, player.velocity.z,
+                        player.is_grounded
+                    );
                 }
             }
         }
