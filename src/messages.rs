@@ -8,7 +8,9 @@ pub enum ClientMessage {
         input: PlayerInput,
         sequence: u32,
     },
-    Ping,
+    Ping {
+        timestamp: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

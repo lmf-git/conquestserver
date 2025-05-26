@@ -176,11 +176,16 @@ async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::Input { input, sequence } => {
-            // Only update physics world - it's the source of truth
+            // Update in physics world
             {
                 let mut physics_world = game_state.physics_world.write().await;
                 if let Some(physics_player) = physics_world.players.get_mut(&player_id) {
                     physics_player.apply_input(input, sequence);
+                    
+                    // Also update in game state for immediate reflection
+                    if let Some(mut game_player) = game_state.players.get_mut(&player_id) {
+                        game_player.apply_input(input, sequence);
+                    }
                 }
             }
         }
@@ -195,6 +200,7 @@ async fn handle_client_message(
 
 async fn physics_loop(game_state: GameState) {
     let mut interval = tokio::time::interval(Duration::from_millis(16)); // 60 FPS
+    let mut last_broadcast = tokio::time::Instant::now();
     
     loop {
         interval.tick().await;
@@ -208,13 +214,22 @@ async fn physics_loop(game_state: GameState) {
             for (player_id, physics_player) in &physics_world.players {
                 if let Some(mut game_player) = game_state.players.get_mut(player_id) {
                     // Copy all fields from physics player to game player
-                    *game_player = physics_player.clone();
+                    game_player.value_mut().position = physics_player.position;
+                    game_player.value_mut().velocity = physics_player.velocity;
+                    game_player.value_mut().rotation = physics_player.rotation;
+                    game_player.value_mut().is_grounded = physics_player.is_grounded;
+                    game_player.value_mut().world_origin = physics_player.world_origin;
+                    game_player.value_mut().input_sequence = physics_player.input_sequence;
                 }
             }
         }
         
-        // Broadcast state update
-        broadcast_state(&game_state).await;
+        // Broadcast state update at 20Hz to reduce network traffic
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_broadcast) >= Duration::from_millis(50) {
+            broadcast_state(&game_state).await;
+            last_broadcast = now;
+        }
     }
 }
 

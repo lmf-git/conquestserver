@@ -95,7 +95,17 @@ impl Player {
             self.input.world_origin[1], 
             self.input.world_origin[2]
         );
-        // Input processing will happen in update_physics
+        
+        // Update position from client's world position (for reconciliation)
+        let client_world_pos = Vector3::new(
+            input.world_position[0],
+            input.world_position[1],
+            input.world_position[2]
+        );
+        
+        // Convert to local position
+        let local_pos = client_world_pos - self.world_origin;
+        self.position = Point3::from(local_pos);
     }
     
     pub fn update_physics(&mut self, rigid_body_set: &mut RigidBodySet, collider_set: &ColliderSet) {
