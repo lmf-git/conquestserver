@@ -113,19 +113,35 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     
     info!("Player {} connected", player_id);
     
+    // Track last activity for timeout detection
+    let last_activity = Arc::new(RwLock::new(tokio::time::Instant::now()));
+    let last_activity_clone = last_activity.clone();
+    
     // Spawn task to handle outgoing messages
     let outgoing_task = tokio::spawn(async move {
+        let mut timeout_check = tokio::time::interval(Duration::from_secs(5));
+        
         loop {
             tokio::select! {
                 Some(msg) = rx.recv() => {
                     let msg_text = serde_json::to_string(&msg).unwrap();
                     if sender.send(Message::Text(msg_text)).await.is_err() {
+                        info!("Failed to send message to player {}, disconnecting", player_id);
                         break;
                     }
                 }
                 Ok(broadcast_msg) = broadcast_rx.recv() => {
                     let msg_text = serde_json::to_string(&broadcast_msg).unwrap();
                     if sender.send(Message::Text(msg_text)).await.is_err() {
+                        info!("Failed to send broadcast to player {}, disconnecting", player_id);
+                        break;
+                    }
+                }
+                _ = timeout_check.tick() => {
+                    // Check if player has timed out (no activity for 30 seconds)
+                    let last = *last_activity_clone.read().await;
+                    if last.elapsed() > Duration::from_secs(30) {
+                        info!("Player {} timed out, disconnecting", player_id);
                         break;
                     }
                 }
@@ -134,25 +150,58 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
         }
     });
     
-    // Handle incoming messages
-    while let Some(msg) = receiver.next().await {
-        if let Ok(msg) = msg {
-            if let Message::Text(text) = msg {
-                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                    handle_client_message(
-                        player_id,
-                        client_msg,
-                        &game_state,
-                        &tx,
-                    ).await;
+    // Handle incoming messages with timeout
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut consecutive_errors = 0;
+    
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(msg)) => {
+                        consecutive_errors = 0;
+                        *last_activity.write().await = tokio::time::Instant::now();
+                        
+                        if let Message::Text(text) = msg {
+                            if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                                handle_client_message(
+                                    player_id,
+                                    client_msg,
+                                    &game_state,
+                                    &tx,
+                                ).await;
+                            }
+                        } else if let Message::Close(_) = msg {
+                            info!("Player {} sent close message", player_id);
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("WebSocket error for player {}: {}", player_id, e);
+                        consecutive_errors += 1;
+                        if consecutive_errors > 3 {
+                            info!("Too many errors for player {}, disconnecting", player_id);
+                            break;
+                        }
+                    }
+                    None => {
+                        info!("WebSocket closed for player {}", player_id);
+                        break;
+                    }
                 }
             }
-        } else {
-            break;
+            _ = interval.tick() => {
+                // Check connection health periodically
+                if last_activity.read().await.elapsed() > Duration::from_secs(30) {
+                    info!("Player {} inactive for too long, disconnecting", player_id);
+                    break;
+                }
+            }
         }
     }
     
     // Clean up when player disconnects
+    info!("Cleaning up player {}", player_id);
     outgoing_task.abort();
     
     // Remove player from game
@@ -165,7 +214,7 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     // Notify others that player left
     broadcast_player_left(player_id, &game_state).await;
     
-    info!("Player {} disconnected", player_id);
+    info!("Player {} disconnected and cleaned up", player_id);
 }
 
 async fn handle_client_message(
