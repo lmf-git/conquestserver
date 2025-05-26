@@ -63,15 +63,13 @@ impl PhysicsWorld {
     }
     
     pub fn update_player_input(&mut self, id: Uuid, input: PlayerInput) {
+        // Get the current sequence before borrowing mutably
+        let current_sequence = self.players.get(&id)
+            .map(|player| player.input_sequence)
+            .unwrap_or(0);
+        
+        // Now we can safely get mutable access
         if let Some(player) = self.players.get_mut(&id) {
-            // Get the current sequence from the player in the players HashMap
-            let current_sequence = if let Some(game_player) = self.players.get(&id) {
-                game_player.input_sequence
-            } else {
-                0
-            };
-            
-            // Apply the input with the provided sequence
             player.apply_input(input, current_sequence);
         }
     }
