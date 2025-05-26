@@ -124,7 +124,7 @@ impl Player {
                 // Reset local position to near origin
                 let new_local_pos = Point3::origin();
                 body.set_translation(vector![new_local_pos.x, new_local_pos.y, new_local_pos.z], true);
-                //self.position = new_local_pos;
+                self.position = new_local_pos;
                 
                 tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
                     self.id, shift, self.world_origin);
