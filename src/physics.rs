@@ -219,30 +219,31 @@ impl PhysicsWorld {
         let planet_center = Point3::new(0.0, -250.0, 0.0);
         let gravity_strength = 12.0; // Further reduced gravity strength to prevent instability
         
-        // First, collect handles and world positions for ALL dynamic bodies
-        let mut body_data: Vec<(RigidBodyHandle, Vector3<f32>, bool)> = Vec::new();
-        
+        // Collect body handles SAFELY to avoid borrowing issues
+        let mut body_handles: Vec<RigidBodyHandle> = Vec::new();
         for (handle, body) in self.rigid_body_set.iter() {
             if body.body_type() == RigidBodyType::Dynamic {
+                body_handles.push(handle);
+            }
+        }
+        
+        // Apply gravity to each dynamic body safely
+        for handle in body_handles {
+            // Check if body still exists before accessing it
+            if let Some(body) = self.rigid_body_set.get_mut(handle) {
                 let position = body.translation();
                 
                 // Check if this is a player body and get their world origin
-                let (world_origin, is_player) = if let Some(player) = self.players.values()
+                let world_origin = if let Some(player) = self.players.values()
                     .find(|p| p.body_handle == handle) {
-                    (player.world_origin, true)
+                    player.world_origin
                 } else {
-                    (Vector3::zeros(), false)
+                    Vector3::zeros()
                 };
                 
                 // Calculate world position for gravity calculation
                 let world_position = Vector3::new(position.x, position.y, position.z) + world_origin;
-                body_data.push((handle, world_position, is_player));
-            }
-        }
-        
-        // Now apply planet-centered gravity to each dynamic body
-        for (handle, world_position, is_player) in body_data {
-            if let Some(body) = self.rigid_body_set.get_mut(handle) {
+                
                 // Calculate direction from object to planet center
                 let to_planet = planet_center - Point3::from(world_position);
                 let distance_to_planet = to_planet.magnitude();
@@ -259,16 +260,6 @@ impl PhysicsWorld {
                 let gravity_force = gravity_dir * effective_gravity * body.mass();
                 
                 body.add_force(gravity_force, true);
-                
-                // Log gravity application for debugging (less frequently)
-                if is_player {
-                    tracing::trace!(
-                        "Applied planet gravity to player - World pos: [{:.1}, {:.1}, {:.1}], Distance: {:.1}, Force: [{:.1}, {:.1}, {:.1}]",
-                        world_position.x, world_position.y, world_position.z,
-                        distance_to_planet,
-                        gravity_force.x, gravity_force.y, gravity_force.z
-                    );
-                }
             }
         }
         
@@ -304,16 +295,19 @@ impl PhysicsWorld {
         // Update query pipeline for raycasting
         self.query_pipeline.update(&self.rigid_body_set, &self.collider_set);
         
-        // Update player physics (this handles movement, jumping, etc.)
-        // Use a safer iteration approach
+        // Update player physics SAFELY - collect player IDs first to avoid borrowing conflicts
         let player_ids: Vec<Uuid> = self.players.keys().cloned().collect();
         for player_id in player_ids {
-            // Check if player still exists (might have been removed during iteration)
-            if let Some(player) = self.players.get_mut(&player_id) {
-                // Verify the physics bodies still exist before updating
-                if self.rigid_body_set.get(player.body_handle).is_some() &&
-                   self.collider_set.get(player.collider_handle).is_some() {
-                    player.update_physics(&mut self.rigid_body_set, &self.collider_set);
+            // Verify player and their physics bodies still exist
+            if let Some(player) = self.players.get(&player_id) {
+                let body_exists = self.rigid_body_set.get(player.body_handle).is_some();
+                let collider_exists = self.collider_set.get(player.collider_handle).is_some();
+                
+                if body_exists && collider_exists {
+                    // Safe to update physics
+                    if let Some(player_mut) = self.players.get_mut(&player_id) {
+                        player_mut.update_physics(&mut self.rigid_body_set, &self.collider_set);
+                    }
                 } else {
                     tracing::warn!("Player {} physics bodies missing during update, removing from tracking", player_id);
                     self.players.remove(&player_id);

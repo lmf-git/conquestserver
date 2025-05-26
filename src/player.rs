@@ -206,33 +206,56 @@ impl Player {
     pub fn apply_input(&mut self, input: PlayerInput, sequence: u32) {
         self.input_sequence = sequence;
         
-        // Extract world position before moving input
+        // Extract world position and world origin from client
         let client_world_pos = Vector3::new(
             input.world_position[0],
             input.world_position[1],
             input.world_position[2]
         );
         
-        self.world_origin = Vector3::new(
+        let client_world_origin = Vector3::new(
             input.world_origin[0],
             input.world_origin[1], 
             input.world_origin[2]
         );
         
+        // CRITICAL: Handle world origin shifts properly
+        // If client's world origin is different from ours, we need to reconcile
+        let origin_delta = client_world_origin - self.world_origin;
+        
+        if origin_delta.magnitude() > 1.0 { // Significant origin shift
+            tracing::info!(
+                "Player {} world origin shift detected: client=[{:.1}, {:.1}, {:.1}], server=[{:.1}, {:.1}, {:.1}], delta=[{:.1}, {:.1}, {:.1}]",
+                self.id,
+                client_world_origin.x, client_world_origin.y, client_world_origin.z,
+                self.world_origin.x, self.world_origin.y, self.world_origin.z,
+                origin_delta.x, origin_delta.y, origin_delta.z
+            );
+            
+            // Update our world origin to match client
+            self.world_origin = client_world_origin;
+            
+            // Convert client's world position to new local position
+            let new_local_pos = client_world_pos - self.world_origin;
+            self.position = Point3::from(new_local_pos);
+        } else {
+            // Normal case: convert client world position to our local position
+            let local_pos = client_world_pos - self.world_origin;
+            self.position = Point3::from(local_pos);
+        }
+        
         // Store input for movement calculation
         self.input = input;
-        
-        // Convert to local position
-        let local_pos = client_world_pos - self.world_origin;
-        self.position = Point3::from(local_pos);
         
         // Log significant input changes for debugging
         if self.input.forward || self.input.backward || self.input.left || self.input.right || 
            self.input.jump || self.input.yaw.abs() > 0.01 {
             tracing::debug!(
-                "Player {} input applied - forward: {}, yaw: {:.2}, jump: {}, world_pos: [{:.1}, {:.1}, {:.1}]",
+                "Player {} input applied - forward: {}, yaw: {:.2}, jump: {}, client world pos: [{:.1}, {:.1}, {:.1}], client origin: [{:.1}, {:.1}, {:.1}], our local pos: [{:.1}, {:.1}, {:.1}]",
                 self.id, self.input.forward, self.input.yaw, self.input.jump,
-                client_world_pos.x, client_world_pos.y, client_world_pos.z
+                client_world_pos.x, client_world_pos.y, client_world_pos.z,
+                client_world_origin.x, client_world_origin.y, client_world_origin.z,
+                self.position.x, self.position.y, self.position.z
             );
         }
     }
@@ -243,7 +266,7 @@ impl Player {
         
         // Then update physics with mutable access
         if let Some(body) = rigid_body_set.get_mut(self.body_handle) {
-            // Update position and velocity from physics body
+            // Update position and velocity from physics body FIRST
             let translation = body.translation();
             let linvel = body.linvel();
             let rotation = body.rotation();
@@ -252,90 +275,97 @@ impl Player {
             self.velocity = Vector3::new(linvel.x, linvel.y, linvel.z);
             self.rotation = *rotation;
             
-            // Apply movement based on input - ONLY process if we have actual input
-            let current_vel = body.linvel();
-            let mut new_velocity = Vector3::new(current_vel.x, current_vel.y, current_vel.z);
+            // Only apply movement if we have actual input to prevent jitter
+            let has_movement_input = self.input.forward || self.input.backward || 
+                                   self.input.left || self.input.right;
             
-            // Apply movement based on input
-            let mut move_dir: Vector3<f32> = Vector3::zeros();
-            
-            if self.input.forward {
-                move_dir.z -= 1.0;
-            }
-            if self.input.backward {
-                move_dir.z += 1.0;
-            }
-            if self.input.left {
-                move_dir.x -= 1.0;
-            }
-            if self.input.right {
-                move_dir.x += 1.0;
-            }
-            
-            // Normalize movement
-            if move_dir.magnitude() > 0.0 {
-                move_dir = move_dir.normalize();
-            }
-            
-            // Get player rotation for movement direction
-            let forward = Vector3::new(0.0, 0.0, -1.0);
-            let right = Vector3::new(1.0, 0.0, 0.0);
-            let rotated_forward = self.rotation * forward;
-            let rotated_right = self.rotation * right;
-            
-            // Project movement onto surface if grounded
-            let final_forward = if self.is_grounded {
-                let projected = rotated_forward - self.last_ground_normal * rotated_forward.dot(&self.last_ground_normal);
-                if projected.magnitude() > 0.1 { projected.normalize() } else { rotated_forward }
-            } else {
-                rotated_forward
-            };
-            
-            let final_right = if self.is_grounded {
-                let projected = rotated_right - self.last_ground_normal * rotated_right.dot(&self.last_ground_normal);
-                if projected.magnitude() > 0.1 { projected.normalize() } else { rotated_right }
-            } else {
-                rotated_right
-            };
-            
-            // Calculate movement vector
-            let movement: Vector3<f32> = final_forward * move_dir.z + final_right * move_dir.x;
-            
-            // Apply movement force - be more conservative to prevent conflicts
-            if self.is_grounded {
-                let ground_accel = 60.0f32; // Reduced from 100
-                new_velocity += movement * ground_accel * 0.016f32;
+            if has_movement_input {
+                // Apply movement based on input
+                let current_vel = body.linvel();
+                let mut new_velocity = Vector3::new(current_vel.x, current_vel.y, current_vel.z);
                 
-                // Apply friction when not moving
-                if move_dir.magnitude() == 0.0 {
-                    new_velocity.x *= 0.9; // Increased friction
-                    new_velocity.z *= 0.9;
+                // Calculate movement direction
+                let mut move_dir: Vector3<f32> = Vector3::zeros();
+                
+                if self.input.forward {
+                    move_dir.z -= 1.0;
+                }
+                if self.input.backward {
+                    move_dir.z += 1.0;
+                }
+                if self.input.left {
+                    move_dir.x -= 1.0;
+                }
+                if self.input.right {
+                    move_dir.x += 1.0;
                 }
                 
-                // More aggressive velocity clamping when grounded
-                let world_pos = self.position + self.world_origin;
-                let planet_center = Point3::new(0.0, -250.0, 0.0);
-                let to_planet = planet_center - world_pos;
-                let gravity_dir = to_planet.normalize();
-                
-                let downward_vel = new_velocity.dot(&gravity_dir);
-                if downward_vel > 2.0 { // More aggressive clamping
-                    new_velocity -= gravity_dir * (downward_vel - 1.0);
+                // Normalize movement
+                if move_dir.magnitude() > 0.0 {
+                    move_dir = move_dir.normalize();
                 }
-            } else {
-                // Reduce air control to prevent conflicts
-                let air_control = 0.5f32; // Reduced from 1.0
-                new_velocity += movement * air_control * 0.016f32;
                 
-                // Air resistance
-                new_velocity.x *= 0.98; // More resistance
-                new_velocity.z *= 0.98;
+                // Get player rotation for movement direction
+                let forward = Vector3::new(0.0, 0.0, -1.0);
+                let right = Vector3::new(1.0, 0.0, 0.0);
+                let rotated_forward = self.rotation * forward;
+                let rotated_right = self.rotation * right;
+                
+                // Project movement onto surface if grounded
+                let final_forward = if self.is_grounded {
+                    let projected = rotated_forward - self.last_ground_normal * rotated_forward.dot(&self.last_ground_normal);
+                    if projected.magnitude() > 0.1 { projected.normalize() } else { rotated_forward }
+                } else {
+                    rotated_forward
+                };
+                
+                let final_right = if self.is_grounded {
+                    let projected = rotated_right - self.last_ground_normal * rotated_right.dot(&self.last_ground_normal);
+                    if projected.magnitude() > 0.1 { projected.normalize() } else { rotated_right }
+                } else {
+                    rotated_right
+                };
+                
+                // Calculate movement vector
+                let movement: Vector3<f32> = final_forward * move_dir.z + final_right * move_dir.x;
+                
+                // Apply movement force
+                if self.is_grounded {
+                    let ground_accel = 80.0f32; // Increased for more responsive movement
+                    new_velocity += movement * ground_accel * 0.016f32;
+                    
+                    // Apply friction when not moving
+                    if move_dir.magnitude() == 0.0 {
+                        new_velocity.x *= 0.85; // Friction
+                        new_velocity.z *= 0.85;
+                    }
+                } else {
+                    // Air control
+                    let air_control = 1.0f32;
+                    new_velocity += movement * air_control * 0.016f32;
+                    
+                    // Air resistance
+                    new_velocity.x *= 0.99;
+                    new_velocity.z *= 0.99;
+                }
+                
+                // Set the final velocity
+                body.set_linvel(new_velocity, true);
+                
+                // Log movement for debugging
+                tracing::debug!(
+                    "Player {} movement applied - new vel: [{:.1}, {:.1}, {:.1}], grounded: {}, input: forward={}, backward={}, left={}, right={}",
+                    self.id, new_velocity.x, new_velocity.y, new_velocity.z, self.is_grounded,
+                    self.input.forward, self.input.backward, self.input.left, self.input.right
+                );
             }
             
-            // Handle jump - be more conservative
+            // Handle jump
             if self.input.jump && self.is_grounded {
-                let jump_impulse = self.last_ground_normal * 6.0; // Reduced from 8.0
-                new_velocity += jump_impulse;
+                let jump_impulse = self.last_ground_normal * 8.0; // Increased jump force
+                let current_vel = body.linvel();
+                let new_vel = Vector3::new(current_vel.x, current_vel.y, current_vel.z) + jump_impulse;
+                body.set_linvel(new_vel, true);
                 tracing::debug!("Player {} jumped with impulse: [{:.1}, {:.1}, {:.1}]", 
                     self.id, jump_impulse.x, jump_impulse.y, jump_impulse.z);
             }
@@ -344,22 +374,10 @@ impl Player {
             if self.is_grounded && self.input.yaw.abs() > 0.001 {
                 let yaw_rotation = UnitQuaternion::from_axis_angle(
                     &Unit::new_normalize(self.last_ground_normal),
-                    self.input.yaw * 0.05 // Further reduced rotation speed
+                    self.input.yaw * 0.1 // Increased rotation speed
                 );
                 self.rotation = yaw_rotation * self.rotation;
                 body.set_rotation(self.rotation, true);
-            }
-            
-            // Set the final velocity
-            body.set_linvel(new_velocity, true);
-            
-            // Log significant velocity changes for debugging
-            if new_velocity.magnitude() > 0.1 || (self.input.forward || self.input.backward || self.input.left || self.input.right) {
-                tracing::debug!(
-                    "Player {} velocity updated - new vel: [{:.1}, {:.1}, {:.1}], grounded: {}, input: forward={}, backward={}, left={}, right={}",
-                    self.id, new_velocity.x, new_velocity.y, new_velocity.z, self.is_grounded,
-                    self.input.forward, self.input.backward, self.input.left, self.input.right
-                );
             }
             
             // Check if we need to shift the player's local origin
@@ -382,8 +400,8 @@ impl Player {
     pub fn remove_from_world(&self, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) {
         tracing::info!("Removing player {} from physics world", self.id);
         
-        // Remove collider first
-        if let Some(_collider) = collider_set.get(self.collider_handle) {
+        // Remove collider first - check if it exists
+        if collider_set.get(self.collider_handle).is_some() {
             tracing::debug!("Removing collider for player {}", self.id);
             collider_set.remove(
                 self.collider_handle,
@@ -392,11 +410,11 @@ impl Player {
                 true,
             );
         } else {
-            tracing::warn!("Collider for player {} not found during removal", self.id);
+            tracing::warn!("Collider for player {} not found during removal (may already be removed)", self.id);
         }
         
-        // Then remove rigid body
-        if let Some(_body) = rigid_body_set.get(self.body_handle) {
+        // Then remove rigid body - check if it exists
+        if rigid_body_set.get(self.body_handle).is_some() {
             tracing::debug!("Removing rigid body for player {}", self.id);
             rigid_body_set.remove(
                 self.body_handle,
@@ -407,7 +425,7 @@ impl Player {
                 true,
             );
         } else {
-            tracing::warn!("Rigid body for player {} not found during removal", self.id);
+            tracing::warn!("Rigid body for player {} not found during removal (may already be removed)", self.id);
         }
         
         tracing::info!("Successfully removed player {} from physics world", self.id);
