@@ -1,0 +1,253 @@
+use axum::{
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use dashmap::DashMap;
+use futures::{sink::SinkExt, stream::StreamExt};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::{RwLock, broadcast};
+use tower_http::cors::CorsLayer;
+use tracing::{error, info};
+use uuid::Uuid;
+
+mod physics;
+mod player;
+mod messages;
+
+use physics::PhysicsWorld;
+use player::Player;
+use messages::{ClientMessage, ServerMessage, PlayerState};
+
+#[derive(Clone)]
+struct GameState {
+    players: Arc<DashMap<Uuid, Player>>,
+    physics_world: Arc<RwLock<PhysicsWorld>>,
+    state_broadcaster: broadcast::Sender<ServerMessage>,
+}
+
+#[tokio::main]
+async fn main() {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
+
+    // Create broadcast channel for state updates
+    let (state_tx, _) = broadcast::channel::<ServerMessage>(256);
+
+    // Create game state
+    let game_state = GameState {
+        players: Arc::new(DashMap::new()),
+        physics_world: Arc::new(RwLock::new(PhysicsWorld::new())),
+        state_broadcaster: state_tx,
+    };
+
+    // Start physics simulation loop
+    let physics_state = game_state.clone();
+    tokio::spawn(async move {
+        physics_loop(physics_state).await;
+    });
+
+    // Create router
+    let app = Router::new()
+        .route("/ws", get(websocket_handler))
+        .layer(CorsLayer::permissive())
+        .with_state(game_state);
+
+    // Start server using tokio::net::TcpListener
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    info!("Game server listening on {}", addr);
+    
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind to address");
+    
+    axum::serve(listener, app)
+        .await
+        .expect("Failed to start server");
+}
+
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(game_state): State<GameState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, game_state))
+}
+
+async fn handle_socket(socket: WebSocket, game_state: GameState) {
+    let player_id = Uuid::new_v4();
+    let (mut sender, mut receiver) = socket.split();
+    
+    // Create channels for this player
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+    
+    // Add player to game
+    {
+        let mut physics_world = game_state.physics_world.write().await;
+        let player = physics_world.add_player(player_id);
+        game_state.players.insert(player_id, player);
+    }
+    
+    // Subscribe to broadcast updates
+    let mut broadcast_rx = game_state.state_broadcaster.subscribe();
+    
+    // Send initial state to new player
+    let current_state = get_game_state(&game_state).await;
+    let init_msg = ServerMessage::Init {
+        player_id: player_id.to_string(),
+        state: current_state,
+    };
+    
+    if let Err(e) = tx.send(init_msg) {
+        error!("Failed to send init message: {}", e);
+    }
+    
+    info!("Player {} connected", player_id);
+    
+    // Spawn task to handle outgoing messages
+    let outgoing_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    let msg_text = serde_json::to_string(&msg).unwrap();
+                    if sender.send(Message::Text(msg_text)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(broadcast_msg) = broadcast_rx.recv() => {
+                    let msg_text = serde_json::to_string(&broadcast_msg).unwrap();
+                    if sender.send(Message::Text(msg_text)).await.is_err() {
+                        break;
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+    
+    // Handle incoming messages
+    while let Some(msg) = receiver.next().await {
+        if let Ok(msg) = msg {
+            if let Message::Text(text) = msg {
+                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                    handle_client_message(
+                        player_id,
+                        client_msg,
+                        &game_state,
+                        &tx,
+                    ).await;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    
+    // Clean up when player disconnects
+    outgoing_task.abort();
+    
+    // Remove player from game
+    {
+        let mut physics_world = game_state.physics_world.write().await;
+        physics_world.remove_player(player_id);
+        game_state.players.remove(&player_id);
+    }
+    
+    // Notify others that player left
+    broadcast_player_left(player_id, &game_state).await;
+    
+    info!("Player {} disconnected", player_id);
+}
+
+async fn handle_client_message(
+    player_id: Uuid,
+    msg: ClientMessage,
+    game_state: &GameState,
+    tx: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+) {
+    match msg {
+        ClientMessage::Input { input, sequence } => {
+            // Update both the game state player and physics world player
+            {
+                if let Some(mut player) = game_state.players.get_mut(&player_id) {
+                    player.apply_input(input.clone(), sequence);
+                }
+            }
+            
+            // Update physics world
+            {
+                let mut physics_world = game_state.physics_world.write().await;
+                if let Some(physics_player) = physics_world.players.get_mut(&player_id) {
+                    physics_player.apply_input(input, sequence);
+                }
+            }
+        }
+        ClientMessage::Ping => {
+            let pong = ServerMessage::Pong {
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            let _ = tx.send(pong);
+        }
+    }
+}
+
+async fn physics_loop(game_state: GameState) {
+    let mut interval = tokio::time::interval(Duration::from_millis(16)); // 60 FPS
+    
+    loop {
+        interval.tick().await;
+        
+        // Update physics
+        {
+            let mut physics_world = game_state.physics_world.write().await;
+            physics_world.step();
+            
+            // Update player states from physics - ensure all players in physics world are synced
+            for (player_id, physics_player) in &physics_world.players {
+                if let Some(mut player) = game_state.players.get_mut(player_id) {
+                    // Sync state from physics world to game state
+                    player.position = physics_player.position;
+                    player.velocity = physics_player.velocity;
+                    player.rotation = physics_player.rotation;
+                    player.is_grounded = physics_player.is_grounded;
+                }
+            }
+        }
+        
+        // Broadcast state update
+        broadcast_state(&game_state).await;
+    }
+}
+
+async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<String, PlayerState> {
+    let mut state = std::collections::HashMap::new();
+    
+    // Include all players from both game state and physics world
+    let physics_world = game_state.physics_world.read().await;
+    
+    for (player_id, physics_player) in &physics_world.players {
+        let player_state = physics_player.get_state();
+        state.insert(player_id.to_string(), player_state);
+    }
+    
+    state
+}
+
+async fn broadcast_state(game_state: &GameState) {
+    let state = get_game_state(game_state).await;
+    let msg = ServerMessage::State { state };
+    
+    // Broadcast to all connected clients
+    let _ = game_state.state_broadcaster.send(msg);
+}
+
+async fn broadcast_player_left(player_id: Uuid, game_state: &GameState) {
+    let msg = ServerMessage::PlayerLeft {
+        player_id: player_id.to_string(),
+    };
+    
+    let _ = game_state.state_broadcaster.send(msg);
+}
