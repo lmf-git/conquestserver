@@ -47,11 +47,13 @@ pub struct PlayerInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerState {
-    pub position: [f32; 3],
+    pub position: [f32; 3],  // This is world position (local + origin)
     pub velocity: [f32; 3],
     pub rotation: [f32; 4], // Quaternion (x, y, z, w)
     #[serde(rename = "inputSequence")]
     pub input_sequence: u32,
     #[serde(rename = "isGrounded")]
     pub is_grounded: bool,
+    #[serde(rename = "worldOrigin")]
+    pub world_origin: [f32; 3],  // Add world origin so client knows the offset
 }

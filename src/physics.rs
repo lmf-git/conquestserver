@@ -69,7 +69,20 @@ impl PhysicsWorld {
         for (_, body) in self.rigid_body_set.iter_mut() {
             if body.body_type() == RigidBodyType::Dynamic {
                 let position = body.translation();
-                let to_planet = planet_center - position;
+                
+                // For player bodies, we need to consider their world origin
+                let world_position = if let Some(player_id) = self.find_player_by_body_handle(body.handle()) {
+                    if let Some(player) = self.players.get(&player_id) {
+                        // Convert local position to world position for gravity calculation
+                        position + player.world_origin.coords
+                    } else {
+                        position
+                    }
+                } else {
+                    position
+                };
+                
+                let to_planet = planet_center - Point3::from(world_position);
                 let gravity_dir = to_planet.coords.normalize();
                 let gravity_force = gravity_dir * gravity_strength * body.mass();
                 
@@ -104,6 +117,16 @@ impl PhysicsWorld {
                 player.update_physics(&mut self.rigid_body_set, &self.collider_set);
             }
         }
+    }
+    
+    // Add helper method to find player by body handle
+    fn find_player_by_body_handle(&self, handle: RigidBodyHandle) -> Option<Uuid> {
+        for (id, player) in &self.players {
+            if player.body_handle == handle {
+                return Some(*id);
+            }
+        }
+        None
     }
     
     fn create_planet(&mut self) {

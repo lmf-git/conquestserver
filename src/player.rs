@@ -104,6 +104,22 @@ impl Player {
             self.position = Point3::new(translation.x, translation.y, translation.z);
             self.velocity = *body.linvel();
             
+            // Check if we need to shift the player's local origin
+            let local_distance = self.position.coords.magnitude();
+            if local_distance > 500.0 { // Half of client's ORIGIN_SHIFT_THRESHOLD
+                // Shift the origin
+                let shift = self.position.coords;
+                self.world_origin += shift;
+                
+                // Reset local position to near origin
+                let new_local_pos = Point3::origin();
+                body.set_translation(new_local_pos.coords, true);
+                self.position = new_local_pos;
+                
+                tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
+                    self.id, shift, self.world_origin);
+            }
+            
             // Apply planet-centered gravity (matching client implementation)
             let planet_center = Point3::new(0.0, -250.0, 0.0);
             let gravity_strength = 25.0;
@@ -241,10 +257,11 @@ impl Player {
     }
     
     pub fn get_state(&self) -> PlayerState {
-        // Server always works in world coordinates
-        // The position stored is already in world space
+        // Convert local position to world position for network transmission
+        let world_position = self.position + self.world_origin;
+        
         PlayerState {
-            position: [self.position.x, self.position.y, self.position.z],
+            position: [world_position.x, world_position.y, world_position.z],
             rotation: [
                 self.rotation.i,
                 self.rotation.j,
@@ -254,7 +271,18 @@ impl Player {
             velocity: [self.velocity.x, self.velocity.y, self.velocity.z],
             is_grounded: self.is_grounded,
             input_sequence: self.input_sequence,
+            world_origin: [self.world_origin.x, self.world_origin.y, self.world_origin.z],
         }
+    }
+    
+    // Add method to get local position (for physics calculations)
+    pub fn get_local_position(&self) -> Point3<f32> {
+        self.position
+    }
+    
+    // Add method to convert world position to local position
+    pub fn world_to_local(&self, world_pos: Point3<f32>) -> Point3<f32> {
+        world_pos - self.world_origin
     }
     
     pub fn remove_from_world(&self, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) {
