@@ -260,14 +260,17 @@ async fn handle_client_message(
                     // Apply input to physics player (this will update their movement)
                     physics_player.apply_input(input, sequence);
                     
-                    // Log input received for debugging
-                    if sequence % 60 == 0 { // Log every second
+                    // Log input received for debugging - but less frequently
+                    if sequence % 120 == 0 { // Log every 2 seconds instead of every second
                         tracing::debug!(
                             "Applied input for player {} - sequence: {}, forward: {}, yaw: {:.2}",
                             player_id, sequence, physics_player.input.forward, physics_player.input.yaw
                         );
                     }
                 }
+                
+                // Don't call update_physics here - let the main physics loop handle it
+                // This avoids borrowing conflicts and ensures consistent physics timing
             }
             // Note: Don't update game_state.players here - let physics loop sync it
         }
@@ -306,15 +309,20 @@ async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<Str
                 world_origin: [physics_player.world_origin.x, physics_player.world_origin.y, physics_player.world_origin.z],
             };
             
-            // Debug log actual physics positions being sent
-            tracing::debug!(
-                "Sending state for player {}: physics pos=[{:.1}, {:.1}, {:.1}], world pos=[{:.1}, {:.1}, {:.1}], vel=[{:.1}, {:.1}, {:.1}], grounded={}",
-                player_id,
-                current_translation.x, current_translation.y, current_translation.z,
-                world_pos.x, world_pos.y, world_pos.z,
-                current_velocity.x, current_velocity.y, current_velocity.z,
-                physics_player.is_grounded
-            );
+            // Only log when there's actual movement or periodically
+            let is_moving = current_velocity.magnitude() > 0.1;
+            // Remove the frame_count reference since we don't have access to it here
+            
+            if is_moving {
+                tracing::debug!(
+                    "Sending state for player {}: physics pos=[{:.1}, {:.1}, {:.1}], world pos=[{:.1}, {:.1}, {:.1}], vel=[{:.1}, {:.1}, {:.1}], grounded={}",
+                    player_id,
+                    current_translation.x, current_translation.y, current_translation.z,
+                    world_pos.x, world_pos.y, world_pos.z,
+                    current_velocity.x, current_velocity.y, current_velocity.z,
+                    physics_player.is_grounded
+                );
+            }
             
             state.insert(player_id.to_string(), player_state);
         } else {
@@ -322,7 +330,13 @@ async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<Str
         }
     }
     
-    tracing::debug!("Sending game state with {} players from physics world", state.len());
+    // Only log the total count occasionally with a static counter
+    static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let current_frame = FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if current_frame % 1800 == 0 { // Every 30 seconds
+        tracing::debug!("Sending game state with {} players from physics world", state.len());
+    }
+    
     state
 }
 
@@ -348,8 +362,8 @@ async fn physics_loop(game_state: GameState) {
             // DON'T sync from physics to game state - always use physics as source of truth
             // The get_game_state function will read directly from physics bodies
             
-            // Log player states every second (60 frames) with movement tracking
-            if frame_count % 60 == 0 {
+            // Log player states every 5 seconds (300 frames) instead of every second to reduce spam
+            if frame_count % 300 == 0 {
                 for (player_id, player) in &physics_world.players {
                     // Get actual physics body position
                     if let Some(body) = physics_world.rigid_body_set.get(player.body_handle) {

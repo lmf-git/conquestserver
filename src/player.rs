@@ -353,6 +353,15 @@ impl Player {
             // Set the final velocity
             body.set_linvel(new_velocity, true);
             
+            // Log significant velocity changes for debugging
+            if new_velocity.magnitude() > 0.1 || (self.input.forward || self.input.backward || self.input.left || self.input.right) {
+                tracing::debug!(
+                    "Player {} velocity updated - new vel: [{:.1}, {:.1}, {:.1}], grounded: {}, input: forward={}, backward={}, left={}, right={}",
+                    self.id, new_velocity.x, new_velocity.y, new_velocity.z, self.is_grounded,
+                    self.input.forward, self.input.backward, self.input.left, self.input.right
+                );
+            }
+            
             // Check if we need to shift the player's local origin
             let local_pos_vec = self.position - Point3::origin();
             let local_distance = local_pos_vec.magnitude();
