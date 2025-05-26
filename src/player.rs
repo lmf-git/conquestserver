@@ -89,19 +89,22 @@ impl Player {
     
     pub fn apply_input(&mut self, input: PlayerInput, sequence: u32) {
         self.input_sequence = sequence;
-        self.input = input;
-        self.world_origin = Vector3::new(
-            self.input.world_origin[0],
-            self.input.world_origin[1], 
-            self.input.world_origin[2]
-        );
         
-        // Update position from client's world position (for reconciliation)
+        // Extract world position before moving input
         let client_world_pos = Vector3::new(
             input.world_position[0],
             input.world_position[1],
             input.world_position[2]
         );
+        
+        self.world_origin = Vector3::new(
+            input.world_origin[0],
+            input.world_origin[1], 
+            input.world_origin[2]
+        );
+        
+        // Now we can move input
+        self.input = input;
         
         // Convert to local position
         let local_pos = client_world_pos - self.world_origin;

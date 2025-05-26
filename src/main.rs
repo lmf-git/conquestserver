@@ -180,7 +180,7 @@ async fn handle_client_message(
             {
                 let mut physics_world = game_state.physics_world.write().await;
                 if let Some(physics_player) = physics_world.players.get_mut(&player_id) {
-                    physics_player.apply_input(input, sequence);
+                    physics_player.apply_input(input.clone(), sequence);
                     
                     // Also update in game state for immediate reflection
                     if let Some(mut game_player) = game_state.players.get_mut(&player_id) {
@@ -189,9 +189,9 @@ async fn handle_client_message(
                 }
             }
         }
-        ClientMessage::Ping => {
+        ClientMessage::Ping { timestamp } => {
             let pong = ServerMessage::Pong {
-                timestamp: chrono::Utc::now().timestamp_millis(),
+                timestamp,
             };
             let _ = tx.send(pong);
         }
