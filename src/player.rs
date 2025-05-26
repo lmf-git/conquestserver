@@ -22,10 +22,11 @@ pub struct Player {
 
 impl Player {
     pub fn new(id: Uuid, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) -> Self {
-        // Player spawn position (above platform)
-        let spawn_position = vector![0.0, 35.0, 0.0];
+        // Player spawn position (above platform) - match platform height + clearance
+        let spawn_position = vector![0.0, 35.0, 0.0]; // Platform is at 30, so spawn at 35
         
-        tracing::info!("Creating player with ID: {}", id); // Use the id field
+        tracing::info!("Creating player {} at position: [{:.1}, {:.1}, {:.1}]", 
+            id, spawn_position.x, spawn_position.y, spawn_position.z);
         
         // Create player rigid body
         let rigid_body = RigidBodyBuilder::dynamic()
@@ -87,8 +88,18 @@ impl Player {
     
     pub fn apply_input(&mut self, input: PlayerInput, sequence: u32) {
         // Update world origin if provided
-        self.world_origin = Vector3::new(input.world_origin[0], input.world_origin[1], input.world_origin[2]);
+        let new_origin = Vector3::new(input.world_origin[0], input.world_origin[1], input.world_origin[2]);
         
+        // Log origin changes
+        if (new_origin - self.world_origin).magnitude() > 0.1 {
+            tracing::debug!("Player {} origin updated from [{:.1}, {:.1}, {:.1}] to [{:.1}, {:.1}, {:.1}]",
+                self.id,
+                self.world_origin.x, self.world_origin.y, self.world_origin.z,
+                new_origin.x, new_origin.y, new_origin.z
+            );
+        }
+        
+        self.world_origin = new_origin;
         self.input = input;
         self.input_sequence = sequence;
     }
@@ -121,10 +132,13 @@ impl Player {
                     self.id, shift, self.world_origin);
             }
             
-            // Apply planet-centered gravity (matching client implementation)
-            let planet_center = Point3::new(0.0, -250.0, 0.0);
+            // Apply planet-centered gravity (using WORLD coordinates)
+            let planet_center = Point3::new(0.0, -250.0, 0.0); // Planet center in world coords
             let gravity_strength = 25.0;
-            let to_planet = planet_center - self.position;
+            
+            // Convert player position to world coordinates for gravity calculation
+            let world_position = self.position + self.world_origin;
+            let to_planet = planet_center - world_position;
             let gravity_dir = to_planet.normalize();
             let gravity_force = gravity_dir * gravity_strength * 0.016f32; // 60Hz frame time
             

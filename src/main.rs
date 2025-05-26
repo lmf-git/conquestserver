@@ -94,7 +94,13 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     // Subscribe to broadcast updates
     let mut broadcast_rx = game_state.state_broadcaster.subscribe();
     
-    // Send initial state to new player
+    // Force a physics update to ensure all positions are current
+    {
+        let mut physics_world = game_state.physics_world.write().await;
+        physics_world.step();
+    }
+    
+    // Send initial state to new player with current positions
     let current_state = get_game_state(&game_state).await;
     let init_msg = ServerMessage::Init {
         player_id: player_id.to_string(),
@@ -170,14 +176,7 @@ async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::Input { input, sequence } => {
-            // Update both the game state player and physics world player
-            {
-                if let Some(mut player) = game_state.players.get_mut(&player_id) {
-                    player.apply_input(input.clone(), sequence);
-                }
-            }
-            
-            // Update physics world
+            // Only update physics world - it's the source of truth
             {
                 let mut physics_world = game_state.physics_world.write().await;
                 if let Some(physics_player) = physics_world.players.get_mut(&player_id) {
@@ -205,14 +204,11 @@ async fn physics_loop(game_state: GameState) {
             let mut physics_world = game_state.physics_world.write().await;
             physics_world.step();
             
-            // Update player states from physics - ensure all players in physics world are synced
+            // Sync physics world players to game state players
             for (player_id, physics_player) in &physics_world.players {
-                if let Some(mut player) = game_state.players.get_mut(player_id) {
-                    // Sync state from physics world to game state
-                    player.position = physics_player.position;
-                    player.velocity = physics_player.velocity;
-                    player.rotation = physics_player.rotation;
-                    player.is_grounded = physics_player.is_grounded;
+                if let Some(mut game_player) = game_state.players.get_mut(player_id) {
+                    // Copy all fields from physics player to game player
+                    *game_player = physics_player.clone();
                 }
             }
         }
@@ -222,14 +218,27 @@ async fn physics_loop(game_state: GameState) {
     }
 }
 
+// Get state directly from physics world which is authoritative
 async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<String, PlayerState> {
     let mut state = std::collections::HashMap::new();
     
-    // Include all players from both game state and physics world
     let physics_world = game_state.physics_world.read().await;
     
     for (player_id, physics_player) in &physics_world.players {
         let player_state = physics_player.get_state();
+        
+        // Debug log before moving the state
+        tracing::debug!(
+            "Sending state for player {}: pos=[{:.1}, {:.1}, {:.1}], origin=[{:.1}, {:.1}, {:.1}]",
+            player_id,
+            player_state.position[0],
+            player_state.position[1], 
+            player_state.position[2],
+            player_state.world_origin[0],
+            player_state.world_origin[1],
+            player_state.world_origin[2]
+        );
+        
         state.insert(player_id.to_string(), player_state);
     }
     

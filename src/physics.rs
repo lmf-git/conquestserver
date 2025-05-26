@@ -145,18 +145,18 @@ impl PhysicsWorld {
     }
     
     fn create_platform(&mut self) {
-        // Main platform
-        let platform_half_extents = vector![25.0, 1.5, 25.0];
+        // Main platform - ensure it matches client visual
+        let platform_half_extents = vector![25.0, 1.5, 25.0]; // 50x3x50 total size
         
         let rigid_body = RigidBodyBuilder::fixed()
-            .translation(vector![0.0, 30.0, 0.0])
+            .translation(vector![0.0, 30.0, 0.0]) // Platform center at y=30
             .build();
         
         let handle = self.rigid_body_set.insert(rigid_body);
         
         let collider = ColliderBuilder::cuboid(
             platform_half_extents.x,
-            platform_half_extents.y,
+            platform_half_extents.y, 
             platform_half_extents.z,
         )
         .friction(0.8)
@@ -164,5 +164,7 @@ impl PhysicsWorld {
         .build();
         
         self.collider_set.insert_with_parent(collider, handle, &mut self.rigid_body_set);
+        
+        tracing::info!("Created platform at y=30.0 with size 50x3x50");
     }
 }
