@@ -20,9 +20,13 @@ pub enum ServerMessage {
         #[serde(rename = "playerId")]
         player_id: String,
         state: HashMap<String, PlayerState>,
+        #[serde(rename = "dynamicObjects")]
+        dynamic_objects: HashMap<String, DynamicObjectState>,
     },
     State {
         state: HashMap<String, PlayerState>,
+        #[serde(rename = "dynamicObjects")]
+        dynamic_objects: HashMap<String, DynamicObjectState>,
     },
     PlayerLeft {
         #[serde(rename = "playerId")]
@@ -58,4 +62,14 @@ pub struct PlayerState {
     pub is_grounded: bool,
     #[serde(rename = "worldOrigin")]
     pub world_origin: [f32; 3],  // Add world origin so client knows the offset
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicObjectState {
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub rotation: [f32; 4], // Quaternion (x, y, z, w)
+    #[serde(rename = "objectType")]
+    pub object_type: String,
+    pub scale: f32,
 }

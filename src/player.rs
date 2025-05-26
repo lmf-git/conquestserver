@@ -23,24 +23,38 @@ pub struct Player {
 
 impl Player {
     pub fn new(id: Uuid, rigid_body_set: &mut RigidBodySet, collider_set: &mut ColliderSet) -> Self {
-        // Player spawn position (above platform) - match platform height + clearance
-        let spawn_position = vector![0.0, 35.0, 0.0]; // Platform is at 30, so spawn at 35
+        // Randomize spawn position to avoid overlap with other players
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        let hash = hasher.finish();
+        
+        // Spread players around a circle on the platform
+        let angle = (hash as f32 / u64::MAX as f32) * 2.0 * std::f32::consts::PI;
+        let radius = 5.0; // Keep them on the platform (platform is 50x50)
+        let spawn_x = angle.cos() * radius;
+        let spawn_z = angle.sin() * radius;
+        let spawn_y = 40.0; // Higher spawn to ensure they're above platform
+        
+        let spawn_position = vector![spawn_x, spawn_y, spawn_z];
         
         tracing::info!("Creating player {} at position: [{:.1}, {:.1}, {:.1}]", 
             id, spawn_position.x, spawn_position.y, spawn_position.z);
         
-        // Create player rigid body - DYNAMIC with locked rotations for consistent physics
+        // Create player rigid body - DYNAMIC for proper gravity application but with locked rotations
         let rigid_body = RigidBodyBuilder::dynamic()
             .translation(spawn_position)
-            .linear_damping(0.1)
-            .angular_damping(1.0)
-            .locked_axes(LockedAxes::ROTATION_LOCKED) // Locked rotations for all players
+            .linear_damping(0.5) // Much higher damping for stability
+            .angular_damping(5.0) // Much higher angular damping
             .can_sleep(false)
+            .lock_rotations() // Lock rotations to prevent tumbling while allowing gravity forces
             .build();
         
         let body_handle = rigid_body_set.insert(rigid_body);
         
-        // Create player capsule collider
+        // Create player capsule collider with more conservative settings
         let player_height = 1.8;
         let player_radius = 0.4;
         
@@ -48,9 +62,9 @@ impl Player {
             player_height / 2.0 - player_radius,
             player_radius,
         )
-        .friction(0.0)
+        .friction(0.3) // More friction for stability
         .restitution(0.0)
-        .density(1.0)
+        .density(0.8) // Lighter for less impact forces
         .active_collision_types(ActiveCollisionTypes::default())
         .active_events(ActiveEvents::COLLISION_EVENTS)
         .build();
@@ -68,7 +82,7 @@ impl Player {
             input_sequence: 0,
             world_origin: Vector3::zeros(),
             is_grounded: false,
-            position: Point3::new(0.0, 35.0, 0.0),
+            position: Point3::new(spawn_position.x, spawn_position.y, spawn_position.z),
             velocity: Vector3::zeros(),
             rotation: UnitQuaternion::identity(),
             input: PlayerInput {
@@ -80,7 +94,7 @@ impl Player {
                 run: false,
                 yaw: 0.0,
                 pitch: 0.0,
-                world_position: [0.0, 0.0, 0.0],
+                world_position: [spawn_position.x, spawn_position.y, spawn_position.z],
                 world_origin: [0.0, 0.0, 0.0],
             },
             last_ground_normal: Vector3::y(),
@@ -126,29 +140,11 @@ impl Player {
             self.velocity = Vector3::new(linvel.x, linvel.y, linvel.z);
             self.rotation = *rotation;
             
-            // Check if we need to shift the player's local origin
-            let local_pos_vec = self.position - Point3::origin();
-            let local_distance = local_pos_vec.magnitude();
-            if local_distance > 500.0 { // Half of client's ORIGIN_SHIFT_THRESHOLD
-                // Shift the origin
-                let shift = local_pos_vec;
-                self.world_origin += shift;
-                
-                // Reset local position to near origin
-                let new_local_pos = Point3::origin();
-                body.set_translation(vector![new_local_pos.x, new_local_pos.y, new_local_pos.z], true);
-                self.position = new_local_pos;
-                
-                tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
-                    self.id, shift, self.world_origin);
-            }
-            
-            // NOTE: Gravity is already applied in PhysicsWorld::step(), so we don't apply it here
-            // Just get the current velocity that already includes gravity
+            // Apply movement based on input - this was missing for other players!
             let current_vel = body.linvel();
             let mut new_velocity = Vector3::new(current_vel.x, current_vel.y, current_vel.z);
             
-            // Apply movement based on input - fix type annotation
+            // Apply movement based on input
             let mut move_dir: Vector3<f32> = Vector3::zeros();
             
             if self.input.forward {
@@ -190,7 +186,7 @@ impl Player {
                 rotated_right
             };
             
-            // Calculate movement vector with explicit type
+            // Calculate movement vector
             let movement: Vector3<f32> = final_forward * move_dir.z + final_right * move_dir.x;
             
             // Apply movement force
@@ -201,8 +197,18 @@ impl Player {
                 // Apply friction when not moving
                 if move_dir.magnitude() == 0.0 {
                     new_velocity.x *= 0.8;
-                    new_velocity.y *= 0.95;
                     new_velocity.z *= 0.8;
+                }
+                
+                // Clamp velocity against gravity if grounded
+                let world_pos = self.position + self.world_origin;
+                let planet_center = Point3::new(0.0, -250.0, 0.0);
+                let to_planet = planet_center - world_pos;
+                let gravity_dir = to_planet.normalize();
+                
+                let downward_vel = new_velocity.dot(&gravity_dir);
+                if downward_vel > 5.0 { // Prevent excessive downward velocity when grounded
+                    new_velocity -= gravity_dir * (downward_vel - 2.0);
                 }
             } else {
                 // Air control
@@ -211,7 +217,6 @@ impl Player {
                 
                 // Air resistance
                 new_velocity.x *= 0.95;
-                new_velocity.y *= 0.98;
                 new_velocity.z *= 0.95;
             }
             
@@ -219,46 +224,71 @@ impl Player {
             if self.input.jump && self.is_grounded {
                 let jump_impulse = self.last_ground_normal * 8.0;
                 new_velocity += jump_impulse;
+                tracing::debug!("Player {} jumped with impulse: [{:.1}, {:.1}, {:.1}]", 
+                    self.id, jump_impulse.x, jump_impulse.y, jump_impulse.z);
+            }
+            
+            // Apply yaw rotation for visual feedback
+            if self.is_grounded && self.input.yaw.abs() > 0.001 {
+                let yaw_rotation = UnitQuaternion::from_axis_angle(
+                    &Unit::new_normalize(self.last_ground_normal),
+                    self.input.yaw * 0.1 // Reduce rotation speed
+                );
+                self.rotation = yaw_rotation * self.rotation;
+                body.set_rotation(self.rotation, true);
             }
             
             // Set the final velocity
             body.set_linvel(new_velocity, true);
             
-            // Update rotation based on mouse input (only yaw when grounded)
-            if self.is_grounded {
-                // Create unit vector from ground normal for axis-angle rotation
-                let axis = if self.last_ground_normal.magnitude() > 0.1 {
-                    Unit::new_normalize(self.last_ground_normal)
-                } else {
-                    Unit::new_normalize(Vector3::y()) // Default up axis
-                };
+            // Check if we need to shift the player's local origin
+            let local_pos_vec = self.position - Point3::origin();
+            let local_distance = local_pos_vec.magnitude();
+            if local_distance > 500.0 {
+                let shift = local_pos_vec;
+                self.world_origin += shift;
                 
-                let yaw_rotation = UnitQuaternion::from_axis_angle(&axis, self.input.yaw);
-                self.rotation = yaw_rotation * self.rotation;
-                body.set_rotation(self.rotation, true);
+                let new_local_pos = Point3::origin();
+                body.set_translation(vector![new_local_pos.x, new_local_pos.y, new_local_pos.z], true);
+                self.position = new_local_pos;
+                
+                tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
+                    self.id, shift, self.world_origin);
             }
         }
     }
     
     fn check_grounded(&mut self, rigid_body_set: &RigidBodySet, collider_set: &ColliderSet) {
-        // Simple ground check using raycast
+        // Use planet-centered gravity for ground detection (same as physics world)
         if let Some(body) = rigid_body_set.get(self.body_handle) {
-            let ray_origin = Point3::from(*body.translation());
+            let body_position = body.translation();
+            let local_pos = Point3::new(body_position.x, body_position.y, body_position.z);
             
-            // Use gravity direction for ray
+            // Calculate world position for gravity direction
+            let world_pos = local_pos + self.world_origin;
+            let ray_origin = Point3::from(world_pos);
+            
+            // Use same planet center as physics world
             let planet_center = Point3::new(0.0, -250.0, 0.0);
             let to_planet = planet_center - ray_origin;
             let ray_dir = to_planet.normalize();
-            let max_distance = 1.0;
+            let max_distance = 1.5; // Increased raycast distance
             
-            let ray = Ray::new(ray_origin, ray_dir);
+            // Convert back to local space for raycasting
+            let local_ray_origin = Point3::from(local_pos.coords);
+            let ray = Ray::new(local_ray_origin, ray_dir);
             let filter = QueryFilter::default().exclude_collider(self.collider_handle);
             
             // Create a temporary query pipeline for raycasting
             let mut query_pipeline = QueryPipeline::new();
             query_pipeline.update(rigid_body_set, collider_set);
             
-            if let Some((_handle, _toi)) = query_pipeline.cast_ray(
+            // Also check velocity - if moving slowly in gravity direction, likely grounded
+            let velocity = body.linvel();
+            let velocity_in_gravity_dir = velocity.dot(&ray_dir);
+            let slow_descent = velocity_in_gravity_dir < 3.0;
+            
+            if let Some((_handle, toi)) = query_pipeline.cast_ray(
                 rigid_body_set,
                 collider_set,
                 &ray,
@@ -266,15 +296,18 @@ impl Player {
                 true,
                 filter,
             ) {
-                self.is_grounded = true;
+                // Ground hit found
+                self.is_grounded = toi < 1.0 && slow_descent;
                 
-                // For now, use the ray direction as the ground normal
-                // (inverted because the ray points down)
+                // Store the gravity direction as the ground normal (inverted)
                 self.last_ground_normal = -ray_dir;
                 
-                // Note: Getting the exact surface normal at the hit point would require
-                // more complex calculations with the collider shape, so we'll use
-                // the simplified approach for now
+                if self.is_grounded {
+                    tracing::debug!(
+                        "Player {} grounded - Distance to ground: {:.2}, Velocity in gravity dir: {:.2}",
+                        self.id, toi, velocity_in_gravity_dir
+                    );
+                }
             } else {
                 self.is_grounded = false;
             }

@@ -98,20 +98,35 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     {
         let mut physics_world = game_state.physics_world.write().await;
         physics_world.step();
+        
+        // Sync physics world players to game state players immediately
+        for (player_id, physics_player) in &physics_world.players {
+            if let Some(mut game_player) = game_state.players.get_mut(player_id) {
+                // Copy all fields from physics player to game player
+                game_player.value_mut().position = physics_player.position;
+                game_player.value_mut().velocity = physics_player.velocity;
+                game_player.value_mut().rotation = physics_player.rotation;
+                game_player.value_mut().is_grounded = physics_player.is_grounded;
+                game_player.value_mut().world_origin = physics_player.world_origin;
+                game_player.value_mut().input_sequence = physics_player.input_sequence;
+            }
+        }
     }
     
-    // Send initial state to new player with current positions
+    // Send initial state to new player with current positions from physics world
     let current_state = get_game_state(&game_state).await;
+    let dynamic_objects = get_dynamic_objects_state(&game_state).await;
     let init_msg = ServerMessage::Init {
         player_id: player_id.to_string(),
         state: current_state,
+        dynamic_objects,
     };
     
     if let Err(e) = tx.send(init_msg) {
         error!("Failed to send init message: {}", e);
     }
     
-    info!("Player {} connected", player_id);
+    info!("Player {} connected and sent current state with {} players", player_id, game_state.players.len());
     
     // Track last activity for timeout detection
     let last_activity = Arc::new(RwLock::new(tokio::time::Instant::now()));
@@ -289,11 +304,10 @@ async fn physics_loop(game_state: GameState) {
             }
         }
         
-        // Broadcast state update at 20Hz to reduce network traffic
-        let now = tokio::time::Instant::now();
-        if now.duration_since(last_broadcast) >= Duration::from_millis(50) {
+        // Broadcast state at a fixed interval to reduce network traffic
+        if last_broadcast.elapsed() > Duration::from_millis(50) {
             broadcast_state(&game_state).await;
-            last_broadcast = now;
+            last_broadcast = tokio::time::Instant::now();
         }
     }
 }
@@ -307,27 +321,33 @@ async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<Str
     for (player_id, physics_player) in &physics_world.players {
         let player_state = physics_player.get_state();
         
-        // Debug log before moving the state
+        // Debug log current physics positions
+        let world_pos = physics_player.position + physics_player.world_origin;
         tracing::debug!(
-            "Sending state for player {}: pos=[{:.1}, {:.1}, {:.1}], origin=[{:.1}, {:.1}, {:.1}]",
+            "Sending state for player {}: physics pos=[{:.1}, {:.1}, {:.1}], world pos=[{:.1}, {:.1}, {:.1}], origin=[{:.1}, {:.1}, {:.1}], grounded={}",
             player_id,
-            player_state.position[0],
-            player_state.position[1], 
-            player_state.position[2],
-            player_state.world_origin[0],
-            player_state.world_origin[1],
-            player_state.world_origin[2]
+            physics_player.position.x, physics_player.position.y, physics_player.position.z,
+            world_pos.x, world_pos.y, world_pos.z,
+            player_state.world_origin[0], player_state.world_origin[1], player_state.world_origin[2],
+            physics_player.is_grounded
         );
         
         state.insert(player_id.to_string(), player_state);
     }
     
+    tracing::info!("Sending game state with {} players from physics world", state.len());
     state
+}
+
+async fn get_dynamic_objects_state(game_state: &GameState) -> std::collections::HashMap<String, messages::DynamicObjectState> {
+    let physics_world = game_state.physics_world.read().await;
+    physics_world.get_dynamic_objects_state()
 }
 
 async fn broadcast_state(game_state: &GameState) {
     let state = get_game_state(game_state).await;
-    let msg = ServerMessage::State { state };
+    let dynamic_objects = get_dynamic_objects_state(game_state).await;
+    let msg = ServerMessage::State { state, dynamic_objects };
     
     // Broadcast to all connected clients
     let _ = game_state.state_broadcaster.send(msg);

@@ -5,6 +5,16 @@ use std::collections::HashMap;
 
 use crate::player::Player;
 
+pub struct DynamicObject {
+    #[allow(dead_code)]  // Used for identification and future cleanup
+    pub id: Uuid,
+    pub body_handle: RigidBodyHandle,
+    #[allow(dead_code)]  // Used for cleanup when removing objects
+    pub collider_handle: ColliderHandle,
+    pub object_type: String,
+    pub scale: f32,
+}
+
 pub struct PhysicsWorld {
     pub rigid_body_set: RigidBodySet,
     pub collider_set: ColliderSet,
@@ -19,6 +29,7 @@ pub struct PhysicsWorld {
     pub query_pipeline: QueryPipeline,
     pub gravity: Vector3<Real>,
     pub players: HashMap<Uuid, Player>,
+    pub dynamic_objects: HashMap<Uuid, DynamicObject>,
 }
 
 impl PhysicsWorld {
@@ -40,17 +51,29 @@ impl PhysicsWorld {
             query_pipeline: QueryPipeline::new(),
             gravity,
             players: HashMap::new(),
+            dynamic_objects: HashMap::new(),
         };
         
         // Create game world geometry
         physics.create_planet();
         physics.create_platform();
+        physics.create_dynamic_rocks();
         
         physics
     }
     
     pub fn add_player(&mut self, id: Uuid) -> Player {
         let player = Player::new(id, &mut self.rigid_body_set, &mut self.collider_set);
+        
+        // Log the actual spawn position from physics
+        if let Some(body) = self.rigid_body_set.get(player.body_handle) {
+            let pos = body.translation();
+            tracing::info!(
+                "Added player {} to physics world at actual position: [{:.1}, {:.1}, {:.1}]",
+                id, pos.x, pos.y, pos.z
+            );
+        }
+        
         self.players.insert(id, player.clone());
         player
     }
@@ -58,79 +81,6 @@ impl PhysicsWorld {
     pub fn remove_player(&mut self, id: Uuid) {
         if let Some(player) = self.players.remove(&id) {
             player.remove_from_world(&mut self.rigid_body_set, &mut self.collider_set);
-        }
-    }
-    
-    pub fn step(&mut self) {
-        // Apply planet-centered gravity to all dynamic bodies including players
-        let planet_center = Point3::new(0.0, -250.0, 0.0);
-        let gravity_strength = 25.0;
-        
-        // First, collect handles and world positions for ALL dynamic bodies
-        let mut body_data: Vec<(RigidBodyHandle, Vector3<f32>)> = Vec::new();
-        
-        for (handle, body) in self.rigid_body_set.iter() {
-            if body.body_type() == RigidBodyType::Dynamic {
-                let position = body.translation();
-                
-                // Check if this is a player body and get their world origin
-                let world_origin = self.players.values()
-                    .find(|p| p.body_handle == handle)
-                    .map(|p| p.world_origin)
-                    .unwrap_or(Vector3::zeros());
-                
-                // Calculate world position
-                let world_position = Vector3::new(position.x, position.y, position.z) + world_origin;
-                body_data.push((handle, world_position));
-            }
-        }
-        
-        // Now apply gravity to each dynamic body (including all players)
-        for (handle, world_position) in body_data {
-            if let Some(body) = self.rigid_body_set.get_mut(handle) {
-                let to_planet = planet_center - Point3::from(world_position);
-                let gravity_dir = to_planet.normalize();
-                let gravity_force = gravity_dir * gravity_strength * body.mass();
-                
-                body.add_force(gravity_force, true);
-                
-                // Debug log for player bodies
-                if self.players.values().any(|p| p.body_handle == handle) {
-                    tracing::debug!(
-                        "Applied gravity to player body: force=[{:.2}, {:.2}, {:.2}], world_pos=[{:.1}, {:.1}, {:.1}]",
-                        gravity_force.x, gravity_force.y, gravity_force.z,
-                        world_position.x, world_position.y, world_position.z
-                    );
-                }
-            }
-        }
-        
-        // Step the physics simulation
-        self.physics_pipeline.step(
-            &self.gravity,
-            &self.integration_parameters,
-            &mut self.island_manager,
-            &mut self.broad_phase,
-            &mut self.narrow_phase,
-            &mut self.rigid_body_set,
-            &mut self.collider_set,
-            &mut self.impulse_joint_set,
-            &mut self.multibody_joint_set,
-            &mut self.ccd_solver,
-            Some(&mut self.query_pipeline),
-            &(),
-            &(),
-        );
-        
-        // Update query pipeline for raycasting
-        self.query_pipeline.update(&self.rigid_body_set, &self.collider_set);
-        
-        // Update player physics (this handles movement, jumping, etc.)
-        let player_ids: Vec<Uuid> = self.players.keys().cloned().collect();
-        for player_id in player_ids {
-            if let Some(player) = self.players.get_mut(&player_id) {
-                player.update_physics(&mut self.rigid_body_set, &self.collider_set);
-            }
         }
     }
     
@@ -175,5 +125,174 @@ impl PhysicsWorld {
         self.collider_set.insert_with_parent(collider, handle, &mut self.rigid_body_set);
         
         tracing::info!("Created platform at y=30.0 with size 50x3x50");
+    }
+    
+    fn create_dynamic_rocks(&mut self) {
+        // Only create 1 rock for now to avoid constraint solver issues
+        self.create_pushable_rock(vector![15.0, 40.0, 15.0], 1.0);
+        
+        tracing::info!("Created minimal dynamic objects to prevent physics solver issues");
+    }
+    
+    fn create_pushable_rock(&mut self, position: Vector3<f32>, scale: f32) {
+        let id = Uuid::new_v4();
+        
+        // Create rock rigid body with ultra-conservative settings
+        let rock_body = RigidBodyBuilder::dynamic()
+            .translation(position)
+            .linear_damping(1.5) // Very high damping
+            .angular_damping(1.5) // Very high damping
+            .can_sleep(true)
+            .build();
+        
+        let body_handle = self.rigid_body_set.insert(rock_body);
+        
+        // Create rock collider (sphere for maximum stability)
+        let rock_collider = ColliderBuilder::ball(1.0 * scale) // Smaller radius
+            .density(0.3) // Very light
+            .friction(1.0) // Maximum friction
+            .restitution(0.1) // Minimal bouncing
+            .build();
+        
+        let collider_handle = self.collider_set.insert_with_parent(
+            rock_collider,
+            body_handle,
+            &mut self.rigid_body_set,
+        );
+        
+        let dynamic_object = DynamicObject {
+            id,
+            body_handle,
+            collider_handle,
+            object_type: "rock".to_string(),
+            scale,
+        };
+        
+        self.dynamic_objects.insert(id, dynamic_object);
+        
+        tracing::info!(
+            "Created pushable rock {} at [{:.1}, {:.1}, {:.1}] with scale {:.1}",
+            id, position.x, position.y, position.z, scale
+        );
+    }
+    
+    pub fn get_dynamic_objects_state(&self) -> HashMap<String, crate::messages::DynamicObjectState> {
+        let mut state = HashMap::new();
+        
+        for (id, obj) in &self.dynamic_objects {
+            if let Some(body) = self.rigid_body_set.get(obj.body_handle) {
+                let pos = body.translation();
+                let vel = body.linvel();
+                let rot = body.rotation();
+                
+                state.insert(
+                    id.to_string(),
+                    crate::messages::DynamicObjectState {
+                        position: [pos.x, pos.y, pos.z],
+                        velocity: [vel.x, vel.y, vel.z],
+                        rotation: [rot.i, rot.j, rot.k, rot.w],
+                        object_type: obj.object_type.clone(),
+                        scale: obj.scale,
+                    }
+                );
+            }
+        }
+        
+        state
+    }
+    
+    pub fn step(&mut self) {
+        // Apply planet-centered gravity to all dynamic bodies including players
+        let planet_center = Point3::new(0.0, -250.0, 0.0);
+        let gravity_strength = 15.0; // Further reduced gravity strength
+        
+        // First, collect handles and world positions for ALL dynamic bodies
+        let mut body_data: Vec<(RigidBodyHandle, Vector3<f32>, bool)> = Vec::new();
+        
+        for (handle, body) in self.rigid_body_set.iter() {
+            if body.body_type() == RigidBodyType::Dynamic {
+                let position = body.translation();
+                
+                // Check if this is a player body and get their world origin
+                let (world_origin, is_player) = if let Some(player) = self.players.values()
+                    .find(|p| p.body_handle == handle) {
+                    (player.world_origin, true)
+                } else {
+                    (Vector3::zeros(), false)
+                };
+                
+                // Calculate world position for gravity calculation
+                let world_position = Vector3::new(position.x, position.y, position.z) + world_origin;
+                body_data.push((handle, world_position, is_player));
+            }
+        }
+        
+        // Now apply planet-centered gravity to each dynamic body
+        for (handle, world_position, is_player) in body_data {
+            if let Some(body) = self.rigid_body_set.get_mut(handle) {
+                // Calculate direction from object to planet center
+                let to_planet = planet_center - Point3::from(world_position);
+                let distance_to_planet = to_planet.magnitude();
+                
+                // Apply very conservative gravity scaling
+                let gravity_multiplier = if distance_to_planet > 150.0 {
+                    (500.0 / distance_to_planet).min(1.0) // Much more conservative
+                } else {
+                    1.0 // Constant close-range gravity
+                };
+                
+                let gravity_dir = to_planet.normalize();
+                let effective_gravity = gravity_strength * gravity_multiplier;
+                let gravity_force = gravity_dir * effective_gravity * body.mass();
+                
+                body.add_force(gravity_force, true);
+                
+                // Log gravity application for debugging
+                if is_player {
+                    tracing::debug!(
+                        "Applied planet gravity to player - World pos: [{:.1}, {:.1}, {:.1}], Distance: {:.1}, Force: [{:.1}, {:.1}, {:.1}]",
+                        world_position.x, world_position.y, world_position.z,
+                        distance_to_planet,
+                        gravity_force.x, gravity_force.y, gravity_force.z
+                    );
+                }
+            }
+        }
+        
+        // Use ultra-conservative integration parameters
+        let mut ultra_conservative_params = self.integration_parameters.clone();
+        ultra_conservative_params.dt = 1.0 / 60.0; // Fixed timestep
+        ultra_conservative_params.max_velocity_iterations = 2; // Very reduced iterations
+        ultra_conservative_params.max_velocity_friction_iterations = 1; // Minimal friction iterations
+        ultra_conservative_params.max_stabilization_iterations = 1; // Minimal stabilization
+        ultra_conservative_params.max_ccd_substeps = 1; // Minimal CCD
+        
+        // Step the physics simulation with ultra-conservative parameters
+        self.physics_pipeline.step(
+            &self.gravity, // This is still (0,0,0) - we handle gravity manually above
+            &ultra_conservative_params,
+            &mut self.island_manager,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.rigid_body_set,
+            &mut self.collider_set,
+            &mut self.impulse_joint_set,
+            &mut self.multibody_joint_set,
+            &mut self.ccd_solver,
+            Some(&mut self.query_pipeline),
+            &(),
+            &(),
+        );
+        
+        // Update query pipeline for raycasting
+        self.query_pipeline.update(&self.rigid_body_set, &self.collider_set);
+        
+        // Update player physics (this handles movement, jumping, etc.)
+        let player_ids: Vec<Uuid> = self.players.keys().cloned().collect();
+        for player_id in player_ids {
+            if let Some(player) = self.players.get_mut(&player_id) {
+                player.update_physics(&mut self.rigid_body_set, &self.collider_set);
+            }
+        }
     }
 }
