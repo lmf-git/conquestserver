@@ -4,20 +4,21 @@ use uuid::Uuid;
 
 use crate::messages::{PlayerState, PlayerInput};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Player {
     #[allow(dead_code)]  // We use this for logging and identification
     pub id: Uuid,
     pub body_handle: RigidBodyHandle,
     pub collider_handle: ColliderHandle,
-    pub position: Point3<f32>,
-    pub rotation: UnitQuaternion<f32>,
-    pub velocity: Vector3<f32>,
-    pub input: PlayerInput,
     pub input_sequence: u32,
-    pub is_grounded: bool,
-    pub last_ground_normal: Vector3<f32>,
     pub world_origin: Vector3<f32>,
+    pub is_grounded: bool,
+    // Add missing fields that are referenced in update_physics
+    pub position: Point3<f32>,
+    pub velocity: Vector3<f32>,
+    pub rotation: UnitQuaternion<f32>,
+    pub input: PlayerInput,
+    pub last_ground_normal: Vector3<f32>,
 }
 
 impl Player {
@@ -28,12 +29,12 @@ impl Player {
         tracing::info!("Creating player {} at position: [{:.1}, {:.1}, {:.1}]", 
             id, spawn_position.x, spawn_position.y, spawn_position.z);
         
-        // Create player rigid body
+        // Create player rigid body - DYNAMIC with locked rotations for consistent physics
         let rigid_body = RigidBodyBuilder::dynamic()
             .translation(spawn_position)
             .linear_damping(0.1)
             .angular_damping(1.0)
-            .locked_axes(LockedAxes::ROTATION_LOCKED)
+            .locked_axes(LockedAxes::ROTATION_LOCKED) // Locked rotations for all players
             .can_sleep(false)
             .build();
         
@@ -64,9 +65,12 @@ impl Player {
             id,
             body_handle,
             collider_handle,
-            position: Point3::from(spawn_position),
-            rotation: UnitQuaternion::identity(),
+            input_sequence: 0,
+            world_origin: Vector3::zeros(),
+            is_grounded: false,
+            position: Point3::new(0.0, 35.0, 0.0),
             velocity: Vector3::zeros(),
+            rotation: UnitQuaternion::identity(),
             input: PlayerInput {
                 forward: false,
                 backward: false,
@@ -79,29 +83,19 @@ impl Player {
                 world_position: [0.0, 0.0, 0.0],
                 world_origin: [0.0, 0.0, 0.0],
             },
-            input_sequence: 0,
-            is_grounded: false,
             last_ground_normal: Vector3::y(),
-            world_origin: Vector3::zeros(), // Initialize origin offset
         }
     }
     
     pub fn apply_input(&mut self, input: PlayerInput, sequence: u32) {
-        // Update world origin if provided
-        let new_origin = Vector3::new(input.world_origin[0], input.world_origin[1], input.world_origin[2]);
-        
-        // Log origin changes
-        if (new_origin - self.world_origin).magnitude() > 0.1 {
-            tracing::debug!("Player {} origin updated from [{:.1}, {:.1}, {:.1}] to [{:.1}, {:.1}, {:.1}]",
-                self.id,
-                self.world_origin.x, self.world_origin.y, self.world_origin.z,
-                new_origin.x, new_origin.y, new_origin.z
-            );
-        }
-        
-        self.world_origin = new_origin;
-        self.input = input;
         self.input_sequence = sequence;
+        self.input = input;
+        self.world_origin = Vector3::new(
+            self.input.world_origin[0],
+            self.input.world_origin[1], 
+            self.input.world_origin[2]
+        );
+        // Input processing will happen in update_physics
     }
     
     pub fn update_physics(&mut self, rigid_body_set: &mut RigidBodySet, collider_set: &ColliderSet) {
@@ -112,8 +106,12 @@ impl Player {
         if let Some(body) = rigid_body_set.get_mut(self.body_handle) {
             // Update position and velocity from physics body
             let translation = body.translation();
+            let linvel = body.linvel();
+            let rotation = body.rotation();
+            
             self.position = Point3::new(translation.x, translation.y, translation.z);
-            self.velocity = *body.linvel();
+            self.velocity = Vector3::new(linvel.x, linvel.y, linvel.z);
+            self.rotation = *rotation;
             
             // Check if we need to shift the player's local origin
             let local_pos_vec = self.position - Point3::origin();
@@ -126,7 +124,7 @@ impl Player {
                 // Reset local position to near origin
                 let new_local_pos = Point3::origin();
                 body.set_translation(vector![new_local_pos.x, new_local_pos.y, new_local_pos.z], true);
-                self.position = new_local_pos;
+                //self.position = new_local_pos;
                 
                 tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
                     self.id, shift, self.world_origin);

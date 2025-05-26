@@ -62,11 +62,11 @@ impl PhysicsWorld {
     }
     
     pub fn step(&mut self) {
-        // Apply planet-centered gravity to all dynamic bodies
+        // Apply planet-centered gravity to all dynamic bodies including players
         let planet_center = Point3::new(0.0, -250.0, 0.0);
         let gravity_strength = 25.0;
         
-        // First, collect handles and world positions for dynamic bodies
+        // First, collect handles and world positions for ALL dynamic bodies
         let mut body_data: Vec<(RigidBodyHandle, Vector3<f32>)> = Vec::new();
         
         for (handle, body) in self.rigid_body_set.iter() {
@@ -85,7 +85,7 @@ impl PhysicsWorld {
             }
         }
         
-        // Now apply gravity to each dynamic body
+        // Now apply gravity to each dynamic body (including all players)
         for (handle, world_position) in body_data {
             if let Some(body) = self.rigid_body_set.get_mut(handle) {
                 let to_planet = planet_center - Point3::from(world_position);
@@ -157,7 +157,7 @@ impl PhysicsWorld {
         let collider = ColliderBuilder::cuboid(
             platform_half_extents.x,
             platform_half_extents.y, 
-            platform_half_extents.z,
+            platform_half_extents.z
         )
         .friction(0.8)
         .restitution(0.2)
