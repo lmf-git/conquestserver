@@ -2,7 +2,7 @@ use nalgebra::{Point3, UnitQuaternion, Vector3, Unit};
 use rapier3d::prelude::*;
 use uuid::Uuid;
 
-use crate::messages::{PlayerState, PlayerInput};
+use crate::messages::PlayerInput;
 
 #[derive(Debug, Clone)]
 pub struct Player {
@@ -367,25 +367,6 @@ impl Player {
                 tracing::info!("Shifted player {} origin by {:?}, new world origin: {:?}", 
                     self.id, shift, self.world_origin);
             }
-        }
-    }
-    
-    pub fn get_state(&self) -> PlayerState {
-        // Convert local position to world position for network transmission
-        let world_position = self.position + self.world_origin;
-        
-        PlayerState {
-            position: [world_position.x, world_position.y, world_position.z],
-            rotation: [
-                self.rotation.i,
-                self.rotation.j,
-                self.rotation.k,
-                self.rotation.w,
-            ],
-            velocity: [self.velocity.x, self.velocity.y, self.velocity.z],
-            is_grounded: self.is_grounded,
-            input_sequence: self.input_sequence,
-            world_origin: [self.world_origin.x, self.world_origin.y, self.world_origin.z],
         }
     }
     

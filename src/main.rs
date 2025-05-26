@@ -14,6 +14,7 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 use uuid::Uuid;
+use nalgebra::Point3; // Add this import
 
 mod physics;
 mod player;
@@ -127,6 +128,9 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     }
     
     info!("Player {} connected and sent current state with {} players", player_id, game_state.players.len());
+    
+    // IMPORTANT: Broadcast updated state to all existing players so they see the new player
+    broadcast_state(&game_state).await;
     
     // Track last activity for timeout detection
     let last_activity = Arc::new(RwLock::new(tokio::time::Instant::now()));
@@ -276,6 +280,57 @@ async fn handle_client_message(
     }
 }
 
+// Get state directly from physics world which is authoritative
+async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<String, PlayerState> {
+    let mut state = std::collections::HashMap::new();
+    
+    let physics_world = game_state.physics_world.read().await;
+    
+    for (player_id, physics_player) in &physics_world.players {
+        // Get CURRENT position from physics body, not stored position
+        if let Some(body) = physics_world.rigid_body_set.get(physics_player.body_handle) {
+            let current_translation = body.translation();
+            let current_velocity = body.linvel();
+            let current_rotation = body.rotation();
+            
+            // Convert physics body position to world position
+            let local_pos = Point3::new(current_translation.x, current_translation.y, current_translation.z);
+            let world_pos = local_pos + physics_player.world_origin;
+            
+            let player_state = PlayerState {
+                position: [world_pos.x, world_pos.y, world_pos.z], // Use current physics position
+                velocity: [current_velocity.x, current_velocity.y, current_velocity.z], // Use current physics velocity
+                rotation: [current_rotation.i, current_rotation.j, current_rotation.k, current_rotation.w], // Use current physics rotation
+                is_grounded: physics_player.is_grounded,
+                input_sequence: physics_player.input_sequence,
+                world_origin: [physics_player.world_origin.x, physics_player.world_origin.y, physics_player.world_origin.z],
+            };
+            
+            // Debug log actual physics positions being sent
+            tracing::debug!(
+                "Sending state for player {}: physics pos=[{:.1}, {:.1}, {:.1}], world pos=[{:.1}, {:.1}, {:.1}], vel=[{:.1}, {:.1}, {:.1}], grounded={}",
+                player_id,
+                current_translation.x, current_translation.y, current_translation.z,
+                world_pos.x, world_pos.y, world_pos.z,
+                current_velocity.x, current_velocity.y, current_velocity.z,
+                physics_player.is_grounded
+            );
+            
+            state.insert(player_id.to_string(), player_state);
+        } else {
+            tracing::warn!("Player {} physics body not found when getting state", player_id);
+        }
+    }
+    
+    tracing::debug!("Sending game state with {} players from physics world", state.len());
+    state
+}
+
+async fn get_dynamic_objects_state(game_state: &GameState) -> std::collections::HashMap<String, messages::DynamicObjectState> {
+    let physics_world = game_state.physics_world.read().await;
+    physics_world.get_dynamic_objects_state()
+}
+
 async fn physics_loop(game_state: GameState) {
     let mut interval = tokio::time::interval(Duration::from_millis(16)); // 60 FPS
     let mut last_broadcast = tokio::time::Instant::now();
@@ -290,34 +345,30 @@ async fn physics_loop(game_state: GameState) {
             let mut physics_world = game_state.physics_world.write().await;
             physics_world.step();
             
-            // Sync physics world players to game state players
-            for (player_id, physics_player) in &physics_world.players {
-                if let Some(mut game_player) = game_state.players.get_mut(player_id) {
-                    // Copy all fields from physics player to game player
-                    game_player.value_mut().position = physics_player.position;
-                    game_player.value_mut().velocity = physics_player.velocity;
-                    game_player.value_mut().rotation = physics_player.rotation;
-                    game_player.value_mut().is_grounded = physics_player.is_grounded;
-                    game_player.value_mut().world_origin = physics_player.world_origin;
-                    game_player.value_mut().input_sequence = physics_player.input_sequence;
-                }
-            }
+            // DON'T sync from physics to game state - always use physics as source of truth
+            // The get_game_state function will read directly from physics bodies
             
             // Log player states every second (60 frames) with movement tracking
             if frame_count % 60 == 0 {
                 for (player_id, player) in &physics_world.players {
-                    let world_pos = player.position + player.world_origin;
-                    let is_moving = player.velocity.magnitude() > 0.1;
-                    let has_input = player.input.forward || player.input.backward || 
-                                   player.input.left || player.input.right;
-                    
-                    tracing::info!(
-                        "Player {} - World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}, Moving: {}, Has input: {}",
-                        player_id,
-                        world_pos.x, world_pos.y, world_pos.z,
-                        player.velocity.x, player.velocity.y, player.velocity.z,
-                        player.is_grounded, is_moving, has_input
-                    );
+                    // Get actual physics body position
+                    if let Some(body) = physics_world.rigid_body_set.get(player.body_handle) {
+                        let physics_pos = body.translation();
+                        let physics_vel = body.linvel();
+                        let world_pos = Point3::new(physics_pos.x, physics_pos.y, physics_pos.z) + player.world_origin;
+                        let is_moving = physics_vel.magnitude() > 0.1;
+                        let has_input = player.input.forward || player.input.backward || 
+                                       player.input.left || player.input.right;
+                        
+                        tracing::info!(
+                            "Player {} - Physics pos: [{:.1}, {:.1}, {:.1}], World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}, Moving: {}, Has input: {}",
+                            player_id,
+                            physics_pos.x, physics_pos.y, physics_pos.z,
+                            world_pos.x, world_pos.y, world_pos.z,
+                            physics_vel.x, physics_vel.y, physics_vel.z,
+                            player.is_grounded, is_moving, has_input
+                        );
+                    }
                 }
             }
         }
@@ -328,38 +379,6 @@ async fn physics_loop(game_state: GameState) {
             last_broadcast = tokio::time::Instant::now();
         }
     }
-}
-
-// Get state directly from physics world which is authoritative
-async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<String, PlayerState> {
-    let mut state = std::collections::HashMap::new();
-    
-    let physics_world = game_state.physics_world.read().await;
-    
-    for (player_id, physics_player) in &physics_world.players {
-        let player_state = physics_player.get_state();
-        
-        // Debug log current physics positions
-        let world_pos = physics_player.position + physics_player.world_origin;
-        tracing::debug!(
-            "Sending state for player {}: physics pos=[{:.1}, {:.1}, {:.1}], world pos=[{:.1}, {:.1}, {:.1}], origin=[{:.1}, {:.1}, {:.1}], grounded={}",
-            player_id,
-            physics_player.position.x, physics_player.position.y, physics_player.position.z,
-            world_pos.x, world_pos.y, world_pos.z,
-            player_state.world_origin[0], player_state.world_origin[1], player_state.world_origin[2],
-            physics_player.is_grounded
-        );
-        
-        state.insert(player_id.to_string(), player_state);
-    }
-    
-    tracing::info!("Sending game state with {} players from physics world", state.len());
-    state
-}
-
-async fn get_dynamic_objects_state(game_state: &GameState) -> std::collections::HashMap<String, messages::DynamicObjectState> {
-    let physics_world = game_state.physics_world.read().await;
-    physics_world.get_dynamic_objects_state()
 }
 
 async fn broadcast_state(game_state: &GameState) {
