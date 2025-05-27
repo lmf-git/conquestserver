@@ -51,25 +51,20 @@ impl PlayerManager {
         }
     }
 
-    pub fn add_player(&mut self, id: Uuid, position: Vector3<f32>) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        
-        // Spawn task to handle outgoing messages
-        tokio::spawn(async move {
-            while let Some(_msg) = rx.recv().await {
-                // Messages are already formatted, just forward them
-            }
-        });
-
-        let player = Player::new(id, position, tx);
+    pub fn add_player(&self, id: Uuid, position: Vector3<f32>, sender: mpsc::UnboundedSender<Message>) {
+        let player = Player::new(id, position, sender);
         self.players.insert(id, player);
     }
 
-    pub fn remove_player(&mut self, id: Uuid) {
-        self.players.remove(&id);
+    pub fn remove_player(&self, id: Uuid) {
+        if let Some((_, player)) = self.players.remove(&id) {
+            // Close the sender channel to signal cleanup
+            // The receiver task will naturally end when sender is dropped
+            drop(player.sender);
+        }
     }
 
-    pub fn get_player_mut(&mut self, id: Uuid) -> Option<dashmap::mapref::one::RefMut<Uuid, Player>> {
+    pub fn get_player_mut(&self, id: Uuid) -> Option<dashmap::mapref::one::RefMut<Uuid, Player>> {
         self.players.get_mut(&id)
     }
 

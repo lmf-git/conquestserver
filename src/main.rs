@@ -7,7 +7,7 @@ use axum::{
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use tokio::{self, sync::mpsc, sync::RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -69,10 +69,24 @@ async fn websocket_handler(
 
 async fn handle_socket(socket: WebSocket, state: SharedState) {
     let player_id = Uuid::new_v4();
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
 
     // Determine spawn position (could be randomized or based on game state)
     let spawn_position = nalgebra::Vector3::new(0.0, 35.0, 0.0);
+
+    // Create a channel for the player
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    
+    // Spawn task to handle outgoing messages for this player
+    let mut send_task = tokio::spawn(async move {
+        let mut sender = sender;
+        while let Some(msg) = rx.recv().await {
+            if sender.send(msg).await.is_err() {
+                break; // Connection closed
+            }
+        }
+        sender.close().await
+    });
 
     // Send player their ID and spawn position
     let welcome_msg = ServerMessage::Welcome { 
@@ -83,27 +97,24 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
             z: spawn_position.z,
         }
     };
-    if let Err(e) = sender
-        .send(Message::Text(serde_json::to_string(&welcome_msg).unwrap()))
-        .await
-    {
-        error!("Failed to send welcome message: {}", e);
+    
+    // Send welcome message through channel
+    if tx.send(Message::Text(serde_json::to_string(&welcome_msg).unwrap())).is_err() {
+        error!("Failed to send welcome message to {}", player_id);
         return;
     }
 
     // Add player to game
     {
-        let mut state = state.write().await;
-        state.players.add_player(player_id, spawn_position);
+        let state_read = state.read().await;
+        state_read.players.add_player(player_id, spawn_position, tx.clone());
 
         // Send existing players to new player
-        let players_list = state.players.get_all_players_except(player_id);
+        let players_list = state_read.players.get_all_players_except(player_id);
         let list_msg = ServerMessage::PlayersList { players: players_list };
-        if let Err(e) = sender
-            .send(Message::Text(serde_json::to_string(&list_msg).unwrap()))
-            .await
-        {
-            error!("Failed to send players list: {}", e);
+        
+        if tx.send(Message::Text(serde_json::to_string(&list_msg).unwrap())).is_err() {
+            error!("Failed to send players list to {}", player_id);
         }
 
         // Broadcast new player to others
@@ -111,7 +122,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
             player_id: player_id.to_string(),
             position: Position { x: spawn_position.x, y: spawn_position.y, z: spawn_position.z },
         };
-        state.players.broadcast_except(player_id, &join_msg).await;
+        state_read.players.broadcast_except(player_id, &join_msg).await;
     }
 
     info!("Player {} connected", player_id);
@@ -124,7 +135,10 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                     handle_client_message(player_id, client_msg, &state).await;
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) => {
+                info!("Player {} sent close message", player_id);
+                break;
+            }
             Err(e) => {
                 error!("WebSocket error for player {}: {}", player_id, e);
                 break;
@@ -133,17 +147,20 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
         }
     }
 
-    // Remove player on disconnect
+    // Clean up when player disconnects
     {
-        let mut state = state.write().await;
-        state.players.remove_player(player_id);
+        let state_read = state.read().await;
+        state_read.players.remove_player(player_id);
         
         // Broadcast player left
         let leave_msg = ServerMessage::PlayerLeft {
             player_id: player_id.to_string(),
         };
-        state.players.broadcast_to_all(&leave_msg).await;
+        state_read.players.broadcast_to_all(&leave_msg).await;
     }
+
+    // Cancel the sender task
+    send_task.abort();
 
     info!("Player {} disconnected", player_id);
 }
@@ -155,7 +172,7 @@ async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::PlayerUpdate { position, rotation, velocity } => {
-            let mut state = state.write().await;
+            let state_read = state.read().await;
             
             // Clone the values to avoid move errors
             let pos_clone = position.clone();
@@ -163,7 +180,7 @@ async fn handle_client_message(
             let vel_clone = velocity.clone();
             
             // Update player state
-            if let Some(mut player) = state.players.get_player_mut(player_id) {
+            if let Some(mut player) = state_read.players.get_player_mut(player_id) {
                 player.update_state(pos_clone, rot_clone, vel_clone);
             }
 
@@ -174,7 +191,7 @@ async fn handle_client_message(
                 rotation,
                 velocity,
             };
-            state.players.broadcast_except(player_id, &update_msg).await;
+            state_read.players.broadcast_except(player_id, &update_msg).await;
         }
         ClientMessage::PlayerAction { action, .. } => {
             // Handle other player actions if needed
