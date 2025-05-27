@@ -114,8 +114,8 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
         }
     }
     
-    // Send initial state to new player with current positions from physics world
-    let current_state = get_game_state(&game_state).await;
+    // IMPORTANT: Get current state EXCLUDING the connecting player
+    let current_state = get_active_players_state_excluding(&game_state, player_id).await;
     let dynamic_objects = get_dynamic_objects_state(&game_state).await;
     let init_msg = ServerMessage::Init {
         player_id: player_id.to_string(),
@@ -127,7 +127,7 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
         error!("Failed to send init message: {}", e);
     }
     
-    info!("Player {} connected and sent current state with {} players", player_id, game_state.players.len());
+    info!("Player {} connected and sent current state with {} other players", player_id, game_state.players.len() - 1);
     
     // IMPORTANT: Broadcast updated state to all existing players so they see the new player
     broadcast_state(&game_state).await;
@@ -352,67 +352,105 @@ async fn physics_loop(game_state: GameState) {
     }
 }
 
-// Get state directly from physics world which is authoritative
-async fn get_game_state(game_state: &GameState) -> std::collections::HashMap<String, PlayerState> {
+// Add new function to get only active players
+async fn get_active_players_state_excluding(game_state: &GameState, exclude_player_id: Uuid) -> std::collections::HashMap<String, PlayerState> {
     let mut state = std::collections::HashMap::new();
     
     let physics_world = game_state.physics_world.read().await;
     
-    for (player_id, physics_player) in &physics_world.players {
-        // Get CURRENT position from physics body, not stored position
-        if let Some(body) = physics_world.rigid_body_set.get(physics_player.body_handle) {
-            let current_translation = body.translation();
-            let current_velocity = body.linvel();
-            let current_rotation = body.rotation();
-            
-            // CRITICAL: Convert physics body position (local) to world position properly
-            let local_pos = Point3::new(current_translation.x, current_translation.y, current_translation.z);
-            let world_pos = local_pos + physics_player.world_origin;
-            
-            let player_state = PlayerState {
-                position: [world_pos.x, world_pos.y, world_pos.z], // Send world position
-                velocity: [current_velocity.x, current_velocity.y, current_velocity.z], // Velocity is same in both coordinate systems
-                rotation: [current_rotation.i, current_rotation.j, current_rotation.k, current_rotation.w],
-                is_grounded: physics_player.is_grounded,
-                input_sequence: physics_player.input_sequence,
-                world_origin: [physics_player.world_origin.x, physics_player.world_origin.y, physics_player.world_origin.z], // Send this player's world origin
-            };
-            
-            // Log coordinate conversion for debugging movement
-            let is_moving = current_velocity.magnitude() > 0.1;
-            
-            if is_moving {
-                static MOVEMENT_LOG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let log_count = MOVEMENT_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Only include players that exist in BOTH physics world AND game state, EXCLUDING the specified player
+    for entry in game_state.players.iter() {
+        let player_id = entry.key();
+        
+        // Skip the excluded player
+        if *player_id == exclude_player_id {
+            continue;
+        }
+        
+        if let Some(physics_player) = physics_world.players.get(player_id) {
+            // Get CURRENT position from physics body, not stored position
+            if let Some(body) = physics_world.rigid_body_set.get(physics_player.body_handle) {
+                let current_translation = body.translation();
+                let current_velocity = body.linvel();
+                let current_rotation = body.rotation();
                 
-                if log_count % 60 == 0 {
-                    tracing::debug!(
-                        "Broadcasting player {}: local pos=[{:.1}, {:.1}, {:.1}], world origin=[{:.1}, {:.1}, {:.1}], world pos=[{:.1}, {:.1}, {:.1}], vel=[{:.1}, {:.1}, {:.1}]",
-                        player_id,
-                        local_pos.x, local_pos.y, local_pos.z,
-                        physics_player.world_origin.x, physics_player.world_origin.y, physics_player.world_origin.z,
-                        world_pos.x, world_pos.y, world_pos.z,
-                        current_velocity.x, current_velocity.y, current_velocity.z
-                    );
-                }
+                // CRITICAL: Convert physics body position (local) to world position properly
+                let local_pos = Point3::new(current_translation.x, current_translation.y, current_translation.z);
+                let world_pos = local_pos + physics_player.world_origin;
+                
+                let player_state = PlayerState {
+                    position: [world_pos.x, world_pos.y, world_pos.z], // Send world position
+                    velocity: [current_velocity.x, current_velocity.y, current_velocity.z], // Velocity is same in both coordinate systems
+                    rotation: [current_rotation.i, current_rotation.j, current_rotation.k, current_rotation.w],
+                    is_grounded: physics_player.is_grounded,
+                    input_sequence: physics_player.input_sequence,
+                    world_origin: [physics_player.world_origin.x, physics_player.world_origin.y, physics_player.world_origin.z], // Send this player's world origin
+                };
+                
+                state.insert(player_id.to_string(), player_state);
+            } else {
+                tracing::warn!("Player {} has no physics body, skipping", player_id);
             }
-            
-            state.insert(player_id.to_string(), player_state);
         } else {
-            tracing::warn!("Player {} physics body not found when getting state", player_id);
+            tracing::warn!("Player {} exists in game state but not physics world, skipping", player_id);
+        }
+    }
+    
+    tracing::info!("Returning state for {} other players (excluding {})", state.len(), exclude_player_id);
+    state
+}
+
+// Add function to get all active players (without exclusion)
+async fn get_active_players_state(game_state: &GameState) -> std::collections::HashMap<String, PlayerState> {
+    let mut state = std::collections::HashMap::new();
+    
+    let physics_world = game_state.physics_world.read().await;
+    
+    // Include all players that exist in BOTH physics world AND game state
+    for entry in game_state.players.iter() {
+        let player_id = entry.key();
+        
+        if let Some(physics_player) = physics_world.players.get(player_id) {
+            // Get CURRENT position from physics body, not stored position
+            if let Some(body) = physics_world.rigid_body_set.get(physics_player.body_handle) {
+                let current_translation = body.translation();
+                let current_velocity = body.linvel();
+                let current_rotation = body.rotation();
+                
+                // CRITICAL: Convert physics body position (local) to world position properly
+                let local_pos = Point3::new(current_translation.x, current_translation.y, current_translation.z);
+                let world_pos = local_pos + physics_player.world_origin;
+                
+                let player_state = PlayerState {
+                    position: [world_pos.x, world_pos.y, world_pos.z], // Send world position
+                    velocity: [current_velocity.x, current_velocity.y, current_velocity.z], // Velocity is same in both coordinate systems
+                    rotation: [current_rotation.i, current_rotation.j, current_rotation.k, current_rotation.w],
+                    is_grounded: physics_player.is_grounded,
+                    input_sequence: physics_player.input_sequence,
+                    world_origin: [physics_player.world_origin.x, physics_player.world_origin.y, physics_player.world_origin.z], // Send this player's world origin
+                };
+                
+                state.insert(player_id.to_string(), player_state);
+            } else {
+                tracing::warn!("Player {} has no physics body, skipping", player_id);
+            }
+        } else {
+            tracing::warn!("Player {} exists in game state but not physics world, skipping", player_id);
         }
     }
     
     state
 }
 
-async fn get_dynamic_objects_state(game_state: &GameState) -> std::collections::HashMap<String, messages::DynamicObjectState> {
+// Add function to get dynamic objects state
+async fn get_dynamic_objects_state(game_state: &GameState) -> std::collections::HashMap<String, crate::messages::DynamicObjectState> {
     let physics_world = game_state.physics_world.read().await;
     physics_world.get_dynamic_objects_state()
 }
 
+// Update broadcast_state to use the new function
 async fn broadcast_state(game_state: &GameState) {
-    let state = get_game_state(game_state).await;
+    let state = get_active_players_state(game_state).await;
     let dynamic_objects = get_dynamic_objects_state(game_state).await;
     let msg = ServerMessage::State { state, dynamic_objects };
     
