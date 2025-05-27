@@ -5,6 +5,7 @@ use axum::{
     routing::get,
     Router,
 };
+use futures::{sink::SinkExt, stream::StreamExt};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -17,7 +18,7 @@ mod player;
 
 use messages::*;
 use physics::PhysicsWorld;
-use player::{Player, PlayerManager};
+use player::PlayerManager;
 
 type SharedState = Arc<RwLock<AppState>>;
 
@@ -42,8 +43,8 @@ async fn main() {
         loop {
             interval.tick().await;
             let mut state = physics_state.write().await;
+            // Just step physics - player physics updates will happen separately
             state.physics.step();
-            state.players.update_physics(&mut state.physics);
         }
     });
 
@@ -55,10 +56,8 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     info!("Server listening on {}", addr);
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn websocket_handler(
@@ -118,7 +117,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
     info!("Player {} connected", player_id);
 
     // Handle incoming messages
-    while let Some(msg) = receiver.recv().await {
+    while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
@@ -158,9 +157,14 @@ async fn handle_client_message(
         ClientMessage::PlayerUpdate { position, rotation, velocity } => {
             let mut state = state.write().await;
             
+            // Clone the values to avoid move errors
+            let pos_clone = position.clone();
+            let rot_clone = rotation.clone();
+            let vel_clone = velocity.clone();
+            
             // Update player state
-            if let Some(player) = state.players.get_player_mut(player_id) {
-                player.update_state(position, rotation, velocity);
+            if let Some(mut player) = state.players.get_player_mut(player_id) {
+                player.update_state(pos_clone, rot_clone, vel_clone);
             }
 
             // Broadcast to other players

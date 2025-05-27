@@ -1,9 +1,7 @@
 use crate::messages::{PlayerInfo, Position, Rotation, ServerMessage, Velocity};
-use crate::physics::PhysicsWorld;
 use axum::extract::ws::Message;
 use dashmap::DashMap;
 use nalgebra::Vector3;
-use rapier3d::prelude::*;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -13,8 +11,6 @@ pub struct Player {
     pub position: Vector3<f32>,
     pub rotation: nalgebra::UnitQuaternion<f32>,
     pub velocity: Vector3<f32>,
-    pub rigid_body_handle: Option<RigidBodyHandle>,
-    pub collider_handle: Option<ColliderHandle>,
     pub sender: mpsc::UnboundedSender<Message>,
 }
 
@@ -25,8 +21,6 @@ impl Player {
             position,
             rotation: nalgebra::UnitQuaternion::identity(),
             velocity: Vector3::zeros(),
-            rigid_body_handle: None,
-            collider_handle: None,
             sender,
         }
     }
@@ -62,7 +56,7 @@ impl PlayerManager {
         
         // Spawn task to handle outgoing messages
         tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
+            while let Some(_msg) = rx.recv().await {
                 // Messages are already formatted, just forward them
             }
         });
@@ -108,32 +102,6 @@ impl PlayerManager {
     pub async fn broadcast_to_all(&self, msg: &ServerMessage) {
         for entry in self.players.iter() {
             entry.value().send_message(msg).await;
-        }
-    }
-
-    pub fn update_physics(&mut self, physics: &mut PhysicsWorld) {
-        for mut entry in self.players.iter_mut() {
-            let player = entry.value_mut();
-            
-            // Create rigid body if it doesn't exist
-            if player.rigid_body_handle.is_none() {
-                let (body_handle, collider_handle) = physics.create_player_body(
-                    player.position,
-                    player.rotation,
-                );
-                player.rigid_body_handle = Some(body_handle);
-                player.collider_handle = Some(collider_handle);
-            }
-            
-            // Update physics body with player state
-            if let Some(handle) = player.rigid_body_handle {
-                physics.update_player_body(
-                    handle,
-                    player.position,
-                    player.rotation,
-                    player.velocity,
-                );
-            }
         }
     }
 }

@@ -1,4 +1,4 @@
-use nalgebra::{Isometry3, UnitQuaternion, Vector3};
+use nalgebra::Vector3;
 use rapier3d::prelude::*;
 
 pub struct PhysicsWorld {
@@ -62,15 +62,18 @@ impl PhysicsWorld {
         );
     }
 
+    // The following methods are kept for future use when implementing
+    // authoritative physics simulation
+    
+    /*
     pub fn create_player_body(
         &mut self,
         position: Vector3<f32>,
-        rotation: UnitQuaternion<f32>,
+        _rotation: UnitQuaternion<f32>,
     ) -> (RigidBodyHandle, ColliderHandle) {
         // Create a capsule-shaped rigid body for the player
         let rigid_body = RigidBodyBuilder::dynamic()
             .translation(position)
-            .rotation(rotation)
             .linear_damping(0.1)
             .angular_damping(1.0)
             .lock_rotations()
@@ -121,4 +124,5 @@ impl PhysicsWorld {
             true,
         );
     }
+    */
 }
