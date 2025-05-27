@@ -26,16 +26,12 @@ pub struct PhysicsWorld {
     pub multibody_joint_set: MultibodyJointSet,
     pub ccd_solver: CCDSolver,
     pub query_pipeline: QueryPipeline,
-    pub gravity: Vector3<Real>,
     pub players: HashMap<Uuid, Player>,
     pub dynamic_objects: HashMap<Uuid, DynamicObject>,
 }
 
 impl PhysicsWorld {
     pub fn new() -> Self {
-        // No global gravity - we'll apply planet-centered gravity per object
-        let gravity = Vector3::new(0.0, 0.0, 0.0);
-        
         let mut physics = Self {
             rigid_body_set: RigidBodySet::new(),
             collider_set: ColliderSet::new(),
@@ -47,7 +43,6 @@ impl PhysicsWorld {
             multibody_joint_set: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             query_pipeline: QueryPipeline::new(),
-            gravity,
             players: HashMap::new(),
             dynamic_objects: HashMap::new(),
         };
@@ -83,8 +78,28 @@ impl PhysicsWorld {
             tracing::debug!("Player {} handles - body: {:?}, collider: {:?}", 
                 id, player.body_handle, player.collider_handle);
             
-            // Use the player's own removal method
-            player.remove_from_world(&mut self.rigid_body_set, &mut self.collider_set);
+            // Manually remove player's physics bodies with correct Rapier API
+            if self.collider_set.contains(player.collider_handle) {
+                self.collider_set.remove(
+                    player.collider_handle, 
+                    &mut self.island_manager,
+                    &mut self.rigid_body_set, 
+                    true
+                );
+                tracing::debug!("Removed collider for player {}", id);
+            }
+            
+            if self.rigid_body_set.contains(player.body_handle) {
+                self.rigid_body_set.remove(
+                    player.body_handle,
+                    &mut self.island_manager,
+                    &mut self.collider_set,
+                    &mut self.impulse_joint_set,
+                    &mut self.multibody_joint_set,
+                    false
+                );
+                tracing::debug!("Removed rigid body for player {}", id);
+            }
             
             // Remove from our tracking
             self.players.remove(&id);
@@ -217,65 +232,52 @@ impl PhysicsWorld {
         let gravity_strength = 9.8; // Reduced from 12.0 to prevent instability
         
         // IMPORTANT: Collect valid player handles first to avoid accessing removed players
-        let _valid_player_handles: Vec<(Uuid, RigidBodyHandle)> = self.players.iter()
+        let valid_player_handles: Vec<(Uuid, RigidBodyHandle)> = self.players.iter()
             .filter_map(|(id, player)| {
-                if self.rigid_body_set.get(player.body_handle).is_some() {
+                if self.rigid_body_set.contains(player.body_handle) {
                     Some((*id, player.body_handle))
                 } else {
-                    tracing::warn!("Player {} has invalid body handle, will be cleaned up", id);
                     None
                 }
             })
             .collect();
         
         // Apply gravity to each dynamic body safely with velocity limits
-        for (_handle, body) in self.rigid_body_set.iter_mut() {
+        for (handle, body) in self.rigid_body_set.iter_mut() {
             if body.body_type() == RigidBodyType::Dynamic {
                 let pos = *body.translation();
+                let to_planet_vector = planet_center - pos;
+                let distance = to_planet_vector.coords.magnitude();
+                
+                let gravity_multiplier = if distance > 150.0 {
+                    f32::min(400.0 / distance, 0.8)
+                } else {
+                    0.8
+                };
+                
+                let gravity_dir = to_planet_vector.coords.normalize();
+                let effective_gravity = gravity_strength * gravity_multiplier;
+                
                 let current_vel = *body.linvel();
+                let gravity_force = gravity_dir * effective_gravity * (1.0 / 60.0); // Fixed timestep
                 
-                // Skip if velocity is already too high (indicates instability)
-                if current_vel.magnitude() > 50.0 {
-                    tracing::warn!("Body has excessive velocity {:.1}, clamping", current_vel.magnitude());
-                    let clamped_vel = current_vel.normalize() * 50.0;
-                    body.set_linvel(vector![clamped_vel.x, clamped_vel.y, clamped_vel.z], true);
-                    continue;
-                }
+                let new_vel = current_vel + gravity_force;
                 
-                let obj_pos = Point3::new(pos.x, pos.y, pos.z);
-                let to_planet = planet_center - obj_pos;
-                let distance_to_planet = to_planet.magnitude();
+                // CRITICAL: Much more aggressive velocity clamping for players
+                let is_player = valid_player_handles.iter().any(|(_, ph)| *ph == handle);
+                let max_velocity = if is_player { 25.0 } else { 40.0 }; // Lower limits for players
                 
-                // Much more conservative gravity application
-                if distance_to_planet > 0.1 && distance_to_planet < 1000.0 {
-                    let gravity_dir = to_planet.normalize();
+                let velocity_magnitude = new_vel.magnitude();
+                if velocity_magnitude > max_velocity {
+                    let clamped_vel = new_vel.normalize() * max_velocity;
+                    body.set_linvel(clamped_vel, true);
                     
-                    // Scale gravity based on distance - reduce for very close objects
-                    let gravity_scale = if distance_to_planet < 100.0 {
-                        0.5 // Reduced gravity near surface
-                    } else {
-                        0.8 // Normal gravity further away
-                    };
-                    
-                    let gravity_force = gravity_dir * gravity_strength * gravity_scale;
-                    
-                    // Apply very conservative gravity with strict limits
-                    let new_vel = current_vel + gravity_force * 0.016; // 60 FPS timestep
-                    
-                    // Strict velocity limits to prevent explosion
-                    let max_velocity = 30.0;
-                    let final_vel = if new_vel.magnitude() > max_velocity {
-                        new_vel.normalize() * max_velocity
-                    } else {
-                        new_vel
-                    };
-                    
-                    body.set_linvel(vector![final_vel.x, final_vel.y, final_vel.z], true);
-                } else if distance_to_planet >= 1000.0 {
-                    // If too far, teleport back to platform
-                    tracing::warn!("Body too far from planet center, teleporting back");
-                    body.set_translation(vector![0.0, 35.0, 0.0], true);
-                    body.set_linvel(vector![0.0, 0.0, 0.0], true);
+                    if is_player {
+                        tracing::warn!("Player body has excessive velocity {:.1}, clamping to {:.1}", 
+                                      velocity_magnitude, max_velocity);
+                    }
+                } else {
+                    body.set_linvel(new_vel, true);
                 }
             }
         }
@@ -295,17 +297,19 @@ impl PhysicsWorld {
         let mut invalid_players = Vec::new();
         for (player_id, player) in &self.players {
             if let Some(body) = self.rigid_body_set.get(player.body_handle) {
-                let pos = body.translation();
                 let vel = body.linvel();
+                let pos = body.translation();
                 
-                // Check for NaN or infinite values
-                if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() ||
-                   !vel.x.is_finite() || !vel.y.is_finite() || !vel.z.is_finite() {
-                    tracing::error!("Player {} has invalid position/velocity, marking for cleanup", player_id);
+                // Check for NaN or extreme values
+                if vel.x.is_nan() || vel.y.is_nan() || vel.z.is_nan() ||
+                   pos.x.is_nan() || pos.y.is_nan() || pos.z.is_nan() ||
+                   vel.magnitude() > 100.0 || pos.magnitude() > 10000.0 {
+                    tracing::error!("Player {} has invalid physics state - vel: [{:.1}, {:.1}, {:.1}], pos: [{:.1}, {:.1}, {:.1}]",
+                                   player_id, vel.x, vel.y, vel.z, pos.x, pos.y, pos.z);
                     invalid_players.push(*player_id);
                 }
             } else {
-                tracing::warn!("Player {} has invalid body handle", player_id);
+                tracing::warn!("Player {} has invalid body handle: {:?}", player_id, player.body_handle);
                 invalid_players.push(*player_id);
             }
         }
@@ -318,7 +322,7 @@ impl PhysicsWorld {
         
         // Step the physics simulation
         self.physics_pipeline.step(
-            &self.gravity, // This is still (0,0,0) - we handle gravity manually above
+            &vector![0.0, 0.0, 0.0], // No global gravity
             &integration_params,
             &mut self.island_manager,
             &mut self.broad_phase,
@@ -328,9 +332,9 @@ impl PhysicsWorld {
             &mut self.impulse_joint_set,
             &mut self.multibody_joint_set,
             &mut self.ccd_solver,
-            Some(&mut self.query_pipeline),
+            None,
             &(),
-            &(),
+            &()
         );
         
         // Update query pipeline for raycasting
@@ -339,12 +343,38 @@ impl PhysicsWorld {
         // Update player physics SAFELY - collect player IDs first to avoid borrowing conflicts
         let player_ids: Vec<Uuid> = self.players.keys().cloned().collect();
         for player_id in player_ids {
-            // Verify player still exists and has valid body
             if let Some(player) = self.players.get_mut(&player_id) {
-                if self.rigid_body_set.get(player.body_handle).is_some() {
-                    player.update_physics(&mut self.rigid_body_set, &self.collider_set);
+                // Get body handle before any borrows
+                let body_handle = player.body_handle;
+                
+                // First check - collect velocity data if body exists
+                let velocity_data = if let Some(body) = self.rigid_body_set.get(body_handle) {
+                    let vel = body.linvel();
+                    let magnitude = vel.magnitude();
+                    if magnitude > 25.0 {
+                        Some((magnitude, *vel))
+                    } else {
+                        None
+                    }
                 } else {
-                    tracing::warn!("Player {} body handle became invalid during step", player_id);
+                    None
+                };
+                
+                // Second step - apply emergency velocity reset if needed
+                if let Some((magnitude, old_vel)) = velocity_data {
+                    if let Some(body_mut) = self.rigid_body_set.get_mut(body_handle) {
+                        tracing::error!("Player {} velocity {:.1} exceeded safe limits after physics step, emergency reset", 
+                                       player_id, magnitude);
+                        let safe_vel = nalgebra::Vector3::new(old_vel.x, old_vel.y, old_vel.z).normalize() * 10.0;
+                        body_mut.set_linvel(nalgebra::Vector3::new(safe_vel.x, safe_vel.y, safe_vel.z), true);
+                    }
+                }
+                
+                // Third step - update player physics state
+                if let Some(body) = self.rigid_body_set.get(body_handle) {
+                    player.update_physics(body);
+                } else {
+                    tracing::warn!("Player {} physics body not found during update", player_id);
                 }
             }
         }

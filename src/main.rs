@@ -259,26 +259,154 @@ async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::Input { input, sequence } => {
-            // Update ONLY in physics world - this is the authoritative source
+            // CRITICAL: Rate limit input processing to prevent velocity buildup
+            use once_cell::sync::Lazy;
+            use std::sync::Mutex;
+            
+            static LAST_INPUT_TIME: Lazy<Mutex<std::collections::HashMap<Uuid, std::time::Instant>>> = 
+                Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+            
+            let now = std::time::Instant::now();
+            let should_process = {
+                let mut last_times = LAST_INPUT_TIME.lock().unwrap();
+                let last_time = last_times.get(&player_id).copied().unwrap_or(now - std::time::Duration::from_millis(50));
+                
+                // Only process input if enough time has passed (minimum 16ms = 60fps)
+                if now.duration_since(last_time) >= std::time::Duration::from_millis(16) {
+                    last_times.insert(player_id, now);
+                    true
+                } else {
+                    false
+                }
+            };
+            
+            if !should_process {
+                return; // Skip this input to prevent excessive velocity buildup
+            }
+            
+            // Process input in a more careful way to avoid borrow conflicts
             {
                 let mut physics_world = game_state.physics_world.write().await;
+                
+                // First, apply input to the player
                 if let Some(physics_player) = physics_world.players.get_mut(&player_id) {
-                    // Apply input to physics player (this will update their movement)
                     physics_player.apply_input(input, sequence);
+                }
+                
+                // Then, handle movement application without borrowing conflicts
+                let player_exists = physics_world.players.contains_key(&player_id);
+                if player_exists {
+                    // Extract the needed data to avoid multiple borrows
+                    let (body_handle, player_input, player_is_grounded) = {
+                        let player = physics_world.players.get(&player_id).unwrap();
+                        (player.body_handle, player.input.clone(), player.is_grounded)
+                    };
                     
-                    // Log input received for debugging - but less frequently
-                    if sequence % 120 == 0 { // Log every 2 seconds instead of every second
-                        tracing::debug!(
-                            "Applied input for player {} - sequence: {}, forward: {}, yaw: {:.2}",
-                            player_id, sequence, physics_player.input.forward, physics_player.input.yaw
-                        );
+                    // Handle movement logic directly to avoid borrow conflicts
+                    if let Some(body) = physics_world.rigid_body_set.get_mut(body_handle) {
+                        // Apply the movement logic directly
+                        let current_vel = body.linvel();
+                        let current_speed = current_vel.magnitude();
+                        
+                        if current_speed <= 15.0 { // Only apply movement if speed is reasonable
+                            // Simple movement application
+                            let mut move_forward = 0.0f32;
+                            let mut move_right = 0.0f32;
+                            
+                            if player_input.forward { move_forward += 1.0; }
+                            if player_input.backward { move_forward -= 1.0; }
+                            if player_input.left { move_right -= 1.0; }
+                            if player_input.right { move_right += 1.0; }
+                            
+                            let move_length = (move_forward * move_forward + move_right * move_right).sqrt();
+                            if move_length > 0.0 {
+                                move_forward /= move_length;
+                                move_right /= move_length;
+                            }
+                            
+                            let base_speed = if player_input.run { 8.0 } else { 5.0 };
+                            move_forward *= base_speed;
+                            move_right *= base_speed;
+                            
+                            let rotation = body.rotation();
+                            let forward = rotation.transform_vector(&nalgebra::Vector3::new(0.0, 0.0, -1.0));
+                            let right = rotation.transform_vector(&nalgebra::Vector3::new(1.0, 0.0, 0.0));
+                            
+                            let movement_dir = forward * move_forward + right * move_right;
+                            
+                            if player_is_grounded {
+                                let desired_horizontal = movement_dir * base_speed;
+                                let vertical_component = current_vel.y;
+                                
+                                let new_velocity = if move_length > 0.1 {
+                                    nalgebra::Vector3::new(desired_horizontal.x, vertical_component, desired_horizontal.z)
+                                } else {
+                                    nalgebra::Vector3::new(current_vel.x * 0.8, vertical_component, current_vel.z * 0.8)
+                                };
+                                
+                                let final_velocity = if player_input.jump && player_is_grounded {
+                                    nalgebra::Vector3::new(new_velocity.x, new_velocity.y + 5.0, new_velocity.z)
+                                } else {
+                                    new_velocity
+                                };
+                                
+                                body.set_linvel(final_velocity, true);
+                            }
+                        } else {
+                            // Emergency brake
+                            let safe_vel = current_vel.normalize() * 10.0;
+                            body.set_linvel(safe_vel, true);
+                        }
                     }
                 }
                 
-                // Don't call update_physics here - let the main physics loop handle it
-                // This avoids borrowing conflicts and ensures consistent physics timing
+                // Update the player's stored state in a completely separate scope
+                if physics_world.players.contains_key(&player_id) {
+                    let body_handle = physics_world.players.get(&player_id).unwrap().body_handle;
+                    
+                    // Get the body data we need first
+                    let body_data = {
+                        if let Some(body) = physics_world.rigid_body_set.get(body_handle) {
+                            let translation = body.translation();
+                            let velocity = body.linvel();
+                            let rotation = body.rotation();
+                            Some((
+                                Point3::new(translation.x, translation.y, translation.z),
+                                nalgebra::Vector3::new(velocity.x, velocity.y, velocity.z),
+                                *rotation
+                            ))
+                        } else {
+                            None // Body doesn't exist
+                        }
+                    };
+                    
+                    // Now update the player with this data if we got it
+                    if let Some((body_translation, body_velocity, body_rotation)) = body_data {
+                        if let Some(physics_player_mut) = physics_world.players.get_mut(&player_id) {
+                            physics_player_mut.position = body_translation;
+                            physics_player_mut.velocity = body_velocity;
+                            physics_player_mut.rotation = body_rotation;
+                            
+                            // Velocity sanity check
+                            let vel_magnitude = body_velocity.magnitude();
+                            if vel_magnitude > 30.0 {
+                                tracing::warn!("Player {} has high velocity during update: {:.1}", player_id, vel_magnitude);
+                            }
+                        }
+                    }
+                }
+                
+                // Log excessive velocity
+                if let Some(player) = physics_world.players.get(&player_id) {
+                    if let Some(body) = physics_world.rigid_body_set.get(player.body_handle) {
+                        let vel = body.linvel();
+                        let speed = vel.magnitude();
+                        if speed > 15.0 {
+                            tracing::warn!("Player {} has high velocity {:.1} after input processing", player_id, speed);
+                        }
+                    }
+                }
             }
-            // Note: Don't update game_state.players here - let physics loop sync it
         }
         ClientMessage::Ping { timestamp } => {
             let pong = ServerMessage::Pong {
