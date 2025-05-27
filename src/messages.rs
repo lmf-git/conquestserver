@@ -69,4 +69,6 @@ pub enum ServerMessage {
 pub struct PlayerInfo {
     pub id: String,
     pub position: Position,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Rotation>,
 }

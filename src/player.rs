@@ -86,6 +86,12 @@ impl PlayerManager {
                         y: player.position.y,
                         z: player.position.z,
                     },
+                    rotation: Some(Rotation {
+                        x: player.rotation.i,
+                        y: player.rotation.j,
+                        z: player.rotation.k,
+                        w: player.rotation.w,
+                    }),
                 }
             })
             .collect()
