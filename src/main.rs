@@ -292,32 +292,54 @@ async fn physics_loop(game_state: GameState) {
         interval.tick().await;
         frame_count += 1;
         
-        // Update physics
+        // Update physics - use async write instead of blocking_write
         {
             let mut physics_world = game_state.physics_world.write().await;
             physics_world.step();
             
-            // Log player states every 3 seconds (180 frames) for debugging movement
-            if frame_count % 180 == 0 {
-                for (player_id, player) in &physics_world.players {
-                    // Get actual physics body position
-                    if let Some(body) = physics_world.rigid_body_set.get(player.body_handle) {
-                        let physics_pos = body.translation();
-                        let physics_vel = body.linvel();
-                        let world_pos = Point3::new(physics_pos.x, physics_pos.y, physics_pos.z) + player.world_origin;
-                        let is_moving = physics_vel.magnitude() > 0.1;
-                        let has_input = player.input.forward || player.input.backward || 
-                                       player.input.left || player.input.right;
+            // CRITICAL: Sync physics world players back to game state after physics step
+            // This ensures broadcast_state gets the updated positions
+            for (player_id, physics_player) in &physics_world.players {
+                if let Some(mut game_player) = game_state.players.get_mut(player_id) {
+                    // Get current physics body state
+                    if let Some(body) = physics_world.rigid_body_set.get(physics_player.body_handle) {
+                        let pos = body.translation();
+                        let vel = body.linvel();
+                        let rot = body.rotation();
                         
-                        tracing::info!(
-                            "Player {} - Physics pos: [{:.1}, {:.1}, {:.1}], World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}, Moving: {}, Has input: {}",
-                            player_id,
-                            physics_pos.x, physics_pos.y, physics_pos.z,
-                            world_pos.x, world_pos.y, world_pos.z,
-                            physics_vel.x, physics_vel.y, physics_vel.z,
-                            player.is_grounded, is_moving, has_input
-                        );
+                        // Update game player with physics state
+                        game_player.position = nalgebra::Point3::new(pos.x, pos.y, pos.z);
+                        game_player.velocity = nalgebra::Vector3::new(vel.x, vel.y, vel.z);
+                        game_player.rotation = *rot; // rot is already a UnitQuaternion
+                        game_player.is_grounded = physics_player.is_grounded;
+                        game_player.world_origin = physics_player.world_origin;
+                        game_player.input_sequence = physics_player.input_sequence;
                     }
+                }
+            }
+        }
+        
+        // Log player states every 3 seconds (180 frames) for debugging movement
+        if frame_count % 180 == 0 {
+            let physics_world = game_state.physics_world.read().await;
+            for (player_id, player) in &physics_world.players {
+                // Get actual physics body position
+                if let Some(body) = physics_world.rigid_body_set.get(player.body_handle) {
+                    let physics_pos = body.translation();
+                    let physics_vel = body.linvel();
+                    let world_pos = Point3::new(physics_pos.x, physics_pos.y, physics_pos.z) + player.world_origin;
+                    let is_moving = physics_vel.magnitude() > 0.1;
+                    let has_input = player.input.forward || player.input.backward || 
+                                   player.input.left || player.input.right;
+                    
+                    tracing::info!(
+                        "Player {} - Physics pos: [{:.1}, {:.1}, {:.1}], World pos: [{:.1}, {:.1}, {:.1}], Vel: [{:.1}, {:.1}, {:.1}], Grounded: {}, Moving: {}, Has input: {}",
+                        player_id,
+                        physics_pos.x, physics_pos.y, physics_pos.z,
+                        world_pos.x, world_pos.y, world_pos.z,
+                        physics_vel.x, physics_vel.y, physics_vel.z,
+                        player.is_grounded, is_moving, has_input
+                    );
                 }
             }
         }

@@ -34,14 +34,18 @@ impl Player {
         id.hash(&mut hasher);
         let hash = hasher.finish();
         
-        // Spread players around a circle on the platform
+        // Spread players around a circle on the platform with MORE spacing
         let angle = (hash as f32 / u64::MAX as f32) * 2.0 * std::f32::consts::PI;
-        let radius = 5.0; // Keep them on the platform (platform is 50x50)
+        let radius = 8.0; // Increased radius to avoid overlaps
         let spawn_x = angle.cos() * radius;
         let spawn_z = angle.sin() * radius;
         let spawn_y = 40.0; // Higher spawn to ensure they're above platform
         
-        let spawn_position = vector![spawn_x, spawn_y, spawn_z];
+        // Add small random offset to prevent exact overlaps
+        let offset_x = ((hash % 100) as f32 / 100.0 - 0.5) * 2.0;
+        let offset_z = (((hash >> 8) % 100) as f32 / 100.0 - 0.5) * 2.0;
+        
+        let spawn_position = vector![spawn_x + offset_x, spawn_y, spawn_z + offset_z];
         
         tracing::info!("Creating player {} at position: [{:.1}, {:.1}, {:.1}]", 
             id, spawn_position.x, spawn_position.y, spawn_position.z);
@@ -49,10 +53,11 @@ impl Player {
         // Create player rigid body - DYNAMIC for proper gravity application but with locked rotations
         let rigid_body = RigidBodyBuilder::dynamic()
             .translation(spawn_position)
-            .linear_damping(0.5) // Much higher damping for stability
-            .angular_damping(5.0) // Much higher angular damping
-            .can_sleep(false)
-            .lock_rotations() // Lock rotations to prevent tumbling while allowing gravity forces
+            .lock_rotations() // Lock rotations to prevent tumbling
+            .linear_damping(0.5) // Add damping for stability
+            .angular_damping(5.0) // High angular damping
+            .can_sleep(false) // Keep awake for responsiveness
+            .ccd_enabled(false) // Disable CCD to prevent solver issues
             .build();
         
         let body_handle = rigid_body_set.insert(rigid_body);
@@ -63,19 +68,20 @@ impl Player {
         
         let collider = ColliderBuilder::capsule_y(
             player_height / 2.0 - player_radius,
-            player_radius,
+            player_radius
         )
         .friction(0.3) // More friction for stability
-        .restitution(0.0)
+        .restitution(0.0) // No bouncing
         .density(0.8) // Lighter for less impact forces
         .active_collision_types(ActiveCollisionTypes::default())
         .active_events(ActiveEvents::COLLISION_EVENTS)
+        .contact_force_event_threshold(0.0) // Disable contact force events to reduce overhead
         .build();
         
         let collider_handle = collider_set.insert_with_parent(
             collider,
             body_handle,
-            rigid_body_set,
+            rigid_body_set
         );
         
         Self {
@@ -102,7 +108,7 @@ impl Player {
             },
             last_ground_normal: Vector3::y(),
             last_ground_contact: 0.0,
-            player_height: player_height, // Store the height for later use
+            player_height,
         }
     }
     

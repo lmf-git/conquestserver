@@ -18,7 +18,6 @@ pub struct DynamicObject {
 pub struct PhysicsWorld {
     pub rigid_body_set: RigidBodySet,
     pub collider_set: ColliderSet,
-    pub integration_parameters: IntegrationParameters,
     pub physics_pipeline: PhysicsPipeline,
     pub island_manager: IslandManager,
     pub broad_phase: BroadPhase,
@@ -40,7 +39,6 @@ impl PhysicsWorld {
         let mut physics = Self {
             rigid_body_set: RigidBodySet::new(),
             collider_set: ColliderSet::new(),
-            integration_parameters: IntegrationParameters::default(),
             physics_pipeline: PhysicsPipeline::new(),
             island_manager: IslandManager::new(),
             broad_phase: BroadPhase::new(),
@@ -263,22 +261,39 @@ impl PhysicsWorld {
             }
         }
         
-        // Use extremely conservative integration parameters to prevent solver crashes
-        let mut ultra_conservative_params = self.integration_parameters.clone();
-        ultra_conservative_params.dt = 1.0 / 60.0; // Fixed timestep
-        ultra_conservative_params.max_velocity_iterations = 1; // Minimal iterations
-        ultra_conservative_params.max_velocity_friction_iterations = 1; // Minimal friction iterations
-        ultra_conservative_params.max_stabilization_iterations = 1; // Minimal stabilization
-        ultra_conservative_params.max_ccd_substeps = 1; // Minimal CCD
-        ultra_conservative_params.erp = 0.2; // Reduced error reduction parameter
-        ultra_conservative_params.damping_ratio = 0.25; // Add some damping
-        ultra_conservative_params.joint_erp = 0.2; // Reduced joint error reduction
-        ultra_conservative_params.joint_damping_ratio = 0.25; // Add joint damping
+        // Use conservative integration parameters compatible with the API
+        let mut integration_params = IntegrationParameters::default();
+        integration_params.dt = 1.0 / 60.0; // Fixed timestep
+        integration_params.min_ccd_dt = 1.0 / 120.0; // Minimum CCD timestep
+        integration_params.max_ccd_substeps = 1; // Minimal CCD substeps
+        integration_params.allowed_linear_error = 0.01; // More tolerance for error
+        integration_params.erp = 0.1; // Very low error reduction
+        integration_params.damping_ratio = 0.5; // High damping
+        integration_params.joint_erp = 0.1; // Very low joint error reduction
+        integration_params.joint_damping_ratio = 0.5; // High joint damping
+        // Remove non-existent fields:
+        // - warmstart_coeff
+        // - length_unit  
+        // - normalized_max_corrective_velocity
         
-        // Step the physics simulation with ultra-conservative parameters
+        // Before stepping, ensure all rigid bodies are valid
+        let mut invalid_handles = Vec::new();
+        for (player_id, player) in &self.players {
+            if self.rigid_body_set.get(player.body_handle).is_none() {
+                invalid_handles.push(*player_id);
+            }
+        }
+        
+        // Remove any players with invalid handles
+        for player_id in invalid_handles {
+            tracing::warn!("Removing player {} with invalid body handle", player_id);
+            self.players.remove(&player_id);
+        }
+        
+        // Step the physics simulation
         self.physics_pipeline.step(
             &self.gravity, // This is still (0,0,0) - we handle gravity manually above
-            &ultra_conservative_params,
+            &integration_params,
             &mut self.island_manager,
             &mut self.broad_phase,
             &mut self.narrow_phase,
