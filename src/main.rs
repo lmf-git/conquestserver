@@ -95,26 +95,7 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     // Subscribe to broadcast updates
     let mut broadcast_rx = game_state.state_broadcaster.subscribe();
     
-    // Force a physics update to ensure all positions are current
-    {
-        let mut physics_world = game_state.physics_world.write().await;
-        physics_world.step();
-        
-        // Sync physics world players to game state players immediately
-        for (player_id, physics_player) in &physics_world.players {
-            if let Some(mut game_player) = game_state.players.get_mut(player_id) {
-                // Copy all fields from physics player to game player
-                game_player.value_mut().position = physics_player.position;
-                game_player.value_mut().velocity = physics_player.velocity;
-                game_player.value_mut().rotation = physics_player.rotation;
-                game_player.value_mut().is_grounded = physics_player.is_grounded;
-                game_player.value_mut().world_origin = physics_player.world_origin;
-                game_player.value_mut().input_sequence = physics_player.input_sequence;
-            }
-        }
-    }
-    
-    // IMPORTANT: Get current state EXCLUDING the connecting player
+    // IMPORTANT: Send init message FIRST before any physics updates
     let current_state = get_active_players_state_excluding(&game_state, player_id).await;
     let dynamic_objects = get_dynamic_objects_state(&game_state).await;
     let init_msg = ServerMessage::Init {
@@ -129,7 +110,29 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
     
     info!("Player {} connected and sent current state with {} other players", player_id, game_state.players.len() - 1);
     
-    // IMPORTANT: Broadcast updated state to all existing players so they see the new player
+    // Add small delay to ensure client processes init message before receiving state updates
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // NOW force a physics update and sync
+    {
+        let mut physics_world = game_state.physics_world.write().await;
+        physics_world.step();
+        
+        // Sync physics world players to game state players
+        for (player_id, physics_player) in &physics_world.players {
+            if let Some(mut game_player) = game_state.players.get_mut(player_id) {
+                // Copy all fields from physics player to game player
+                game_player.value_mut().position = physics_player.position;
+                game_player.value_mut().velocity = physics_player.velocity;
+                game_player.value_mut().rotation = physics_player.rotation;
+                game_player.value_mut().is_grounded = physics_player.is_grounded;
+                game_player.value_mut().world_origin = physics_player.world_origin;
+                game_player.value_mut().input_sequence = physics_player.input_sequence;
+            }
+        }
+    }
+    
+    // NOW broadcast state to others
     broadcast_state(&game_state).await;
     
     // Track last activity for timeout detection
@@ -238,6 +241,9 @@ async fn handle_socket(socket: WebSocket, game_state: GameState) {
         // Log remaining player count
         info!("Remaining players in physics world: {}", physics_world.players.len());
     }
+    
+    // Small delay to ensure physics world has processed the removal
+    tokio::time::sleep(Duration::from_millis(50)).await;
     
     // Notify others that player left
     broadcast_player_left(player_id, &game_state).await;
